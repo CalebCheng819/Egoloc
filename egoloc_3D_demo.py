@@ -987,7 +987,7 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
 
     # Dump raw cam-frame wrist dict
     with open(cam_hand_json, "w") as f:
-        json.dump(cam_hand, f)
+        json.dump(cam_hand, f)#记录相机系下手速
 
     # Run registration (world coords)
     reg_out_dir = output_dir / "registered_hands"
