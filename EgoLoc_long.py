@@ -1,3 +1,6 @@
+#export HF_ENDPOINT=https://hf-mirror.com
+#python ./EgoLoc_long.py --credentials auth.env  --grid_size 4  --video_type long
+
 import numpy as np
 import cv2
 import base64
@@ -16,17 +19,22 @@ import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter, find_peaks
 from scipy.interpolate import UnivariateSpline
 import re
+from pathlib import Path
 
-sys.path.append('/home')  # 将 /home 路径添加到模块搜索路径中
-from GroundingDINO.groundingdino.util.inference import load_model, load_image, predict
+sys.path.append('/home/Egoloc/Egolocx')  # 将 /home 路径添加到模块搜索路径中
+sys.path.append('/home/Egoloc')
+sys.path.append('/home/EgoLoc/Grounded-Segment-Anything/GroundingDINO')#必需
+from groundingdino.util.inference import load_model, load_image, predict
 from EgoLocx.script.long_metric import evaluate_all
 from EgoLocx.script.compute_metric import evaluate_predictions
 import tempfile
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+from egoloc_speed import extract_3d_speed_and_visualize#新封装的生成速度文件的函数
+from egoloc_speed import batch_process_videos#对文件夹内的所有视频执行extract_3d_speed_and_visualize
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 _model = load_model(
-    "/home/chengjuntao/data0/EgoLoc/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
-    "/home/chengjuntao/data0/EgoLoc/Grounded-Segment-Anything/GroundingDINO/weights/groundingdino_swint_ogc.pth"
+    "/home/EgoLoc/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+    "/home/EgoLoc/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"#直接放在weights目录外
 )
 
 def run_groundingdino_and_crop(
@@ -125,7 +133,7 @@ def extract_event_info(response):
     # print("event match:",event_match)
     if event_match:
         event_type = event_match.group(1).capitalize()  # Ensure proper capitalization
-        return event_type 
+        return event_type
     else:
         return None
 
@@ -142,16 +150,16 @@ def extract_frame_info(response):
 def enforce_min_distance(indices, min_dist, reference_values):
     if len(indices) == 0:
         return np.array([], dtype=int)
-    
+
     # 按显著性排序（速度值越小越优先）
     sorted_indices = sorted(indices, key=lambda x: reference_values[x])
-    
+
     filtered = []
     for idx in sorted_indices:
         # 检查与已选点的最小距离
         if all(abs(idx - exist) >= min_dist for exist in filtered):
             filtered.append(idx)
-    
+
     # 按原始顺序返回
     return np.sort(np.array(filtered, dtype=int))
 
@@ -161,7 +169,7 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
     spline_s = 1e-4                 # 增大样条平滑因子抑制噪声
     min_peak_prominence = 0.2     # 极小值的最小突出度（需根据数据调整）
     min_peak_distance = 5        # 极小值间最小间隔（单位：帧）
-    savgol_window_ratio = 0.2  
+    savgol_window_ratio = 0.2
 
     filename = f"{video_path}_with_speed.json"
     file_path = os.path.join(folder_path, filename)
@@ -180,7 +188,7 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
     if not isinstance(data, list) or len(data) == 0:
         print(f"❗ 数据为空: {file_path}")
         return []
-    
+
     # 过滤异常值
     filtered_data = [
         (frame, speed) for frame, speed in data
@@ -194,7 +202,7 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
     # =================== Savitzky-Golay 动态窗口 ===================
     data_len = len(speeds)
     window_length = min(
-        max(int(data_len * savgol_window_ratio), 3), 
+        max(int(data_len * savgol_window_ratio), 3),
         data_len
     )
     window_length = window_length + 1 if window_length % 2 == 0 else window_length
@@ -229,16 +237,16 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
             distance=min_peak_distance
         )
         valid_minima = minima[properties['prominences'] > min_peak_prominence]
-        
+
         # 方法2：通过加速度过零点找极小值
         velocity_derivative = np.gradient(speeds_smooth, frames_smooth)
         zero_crossings = np.where(np.diff(np.sign(velocity_derivative)))[0]
         minima_candidates = zero_crossings[np.diff(np.sign(velocity_derivative))[zero_crossings] > 0]
-        
+
         # 合并候选点并强制间距限制
         all_candidates = np.union1d(valid_minima, minima_candidates).astype(int)
         all_minima = enforce_min_distance(all_candidates, min_peak_distance, speeds_smooth)
-        
+
         # 映射到实际帧号（四舍五入+去重）
         extrema_frames = frames_smooth[all_minima]
         extrema_frames_int = np.unique(np.rint(extrema_frames)).astype(int)  # 关键步骤！
@@ -271,12 +279,12 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
     if not isinstance(data, list) or len(data) == 0:
         print(f"❗ 数据为空: {file_path}")
         return []
-    
+
     filtered_data = [
         (frame, speed)
         for frame, speed in data
         if isinstance(speed, (int, float)) and not np.isnan(speed) and 0 < speed < thresh]
-    
+
     if len(filtered_data) < 4:
         print(f"⚠️ 视频 {video_id} 数据点太少（{len(filtered_data)}），跳过！")
         return []
@@ -316,7 +324,7 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
 
     # =================== 极小值检测 ===================
     try:
-        minima_indices, _ = find_peaks(-speeds_smooth)  
+        minima_indices, _ = find_peaks(-speeds_smooth)
         extrema_frames = frames_smooth[minima_indices]
         extrema_speeds = speeds_smooth[minima_indices]
     except Exception as e:
@@ -340,7 +348,7 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
             extrema_frame_speed_pairs.append((matched_frame, speed))
         else:
             print(f"⚠️ 极小值帧 {ef} 不在原始帧列表中，尝试找最近点")
-            
+
             # 兜底方案：找最接近的帧
             idx_nearest = np.argmin(np.abs(frames - ef))
             nearest_frame = frames[idx_nearest]
@@ -391,7 +399,7 @@ def adaptive_sample(minima_indices, mode='linear', exp_k=0.5):
 
 def extract_local_minima_frames_adaptive(
     video_path,
-    folder_path="/home/hand_data_drawer/3D_hand_speed_hamer",
+    folder_path="/home/EgoLoc/hand_data_drawer/3D_hand_speed_hamer",
     # folder_path="/home/bathroomCabinet/3D_hand_speed",
     output_folder="./vis_speed_curve"
 ):
@@ -515,7 +523,7 @@ def select_frames_near_average(filter_indices, grid_size, total_frames, invalid_
                         used_frame_indices.append(end_index)
                 if end_index == total_frames - 1:
                     used_frame_indices.append(end_index)
-    
+
     # 确保最终的索引列表数量为 grid_size^2
     used_frame_indices = used_frame_indices[:grid_size ** 2]
     index = used_frame_indices.index(filter_indices)
@@ -547,7 +555,7 @@ def select_frames_near_average1(filter_indices, grid_size, total_frames, invalid
                         used_frame_indices.append(end_index)
                 if end_index == total_frames - 1:
                     used_frame_indices.append(end_index)
-    
+
     # 确保最终的索引列表数量为 grid_size^2
     used_frame_indices = used_frame_indices[:20]
     index = used_frame_indices.index(filter_indices)
@@ -557,7 +565,7 @@ def select_and_filter_keyframes_with_anchor(selected_indices,total_indices,grid_
     if not selected_indices:
         return []
     video = cv2.VideoCapture(video_path)
-    
+
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
     if search_anchor == 'start':
         # 保证所有关键帧都在视频的前半部分
@@ -591,11 +599,31 @@ def select_and_filter_keyframes_with_anchor(selected_indices,total_indices,grid_
 
 
 # def get_json_path(video_name, base_dir="/home/hand/3D_hand_speed"):
-def get_json_path(video_name, base_dir="/home/hand_data_drawer/3D_hand_speed_hamer"):
-    json_filename = f"{video_name}_with_speed.json"
-    json_path = os.path.join(base_dir, json_filename)
+def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/3D_hand_speed_hamer"):
+    # json_filename = f"{video_name}_with_speed.json"
+    # json_path = os.path.join(base_dir, json_filename)
+    # return json_path
+    """
+    e.g. video_name='video29' ->
+    /home/EgoLoc/hand_data_drawer/3D_hand_speed_hamer/video29/video29_with_speed.json
+    """
+    json_dir = os.path.join(base_dir, video_name)
+    os.makedirs(json_dir, exist_ok=True)  # 确保目录存在（读/写都安全）
+    json_path = os.path.join(json_dir, f"{video_name}_with_speed.json")
     return json_path
 
+def get_json_folder_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/3D_hand_speed_hamer"):
+    # json_filename = f"{video_name}_with_speed.json"
+    # json_path = os.path.join(base_dir, json_filename)
+    # return json_path
+    """
+    e.g. video_name='video29' ->
+    /home/EgoLoc/hand_data_drawer/3D_hand_speed_hamer/video29/video29_with_speed.json
+    """
+    json_dir = os.path.join(base_dir, video_name)
+    os.makedirs(json_dir, exist_ok=True)  # 确保目录存在（读/写都安全）
+
+    return json_dir
 
 
 def select_top_n_frames_from_json(json_path, n, frame_index = None, flag = None, receive_flag = None):
@@ -605,7 +633,7 @@ def select_top_n_frames_from_json(json_path, n, frame_index = None, flag = None,
         valid_frames = [
             (index, speed) for index, speed in data if speed != 0.0 and not math.isnan(speed)
         ]
-        
+
     else:
         if flag == "feedback":
             valid_frames = [
@@ -635,7 +663,7 @@ def select_top_n_frames_from_json(json_path, n, frame_index = None, flag = None,
     else:
         return invalid_list,top_n_frames
 
-    
+
 
 def image_resize_for_vlm(frame, inter=cv2.INTER_AREA):
     height, width = frame.shape[:2]
@@ -674,7 +702,7 @@ def extract_json_part(text_output):
 def get_contact_separation_pairs(results, speed_data):
     # 构建速度字典
     speed_dict = {frame: speed for frame, speed in speed_data}
-    
+
     # 分离 Contact 和 Separation 事件，并提取帧和速度
     contacts = []
     separations = []
@@ -686,36 +714,36 @@ def get_contact_separation_pairs(results, speed_data):
             contacts.append((frame, speed_dict[frame]))
         elif event_type == "Separation":
             separations.append((frame, speed_dict[frame]))
-    
+
     # 按帧索引排序
     contacts.sort()
     separations.sort()
-    
+
     pairs = []
     contact_candidates = []  # 修正点：存储格式改为 (frame, speed)
-    
+
     # 混合排序所有事件（保持原有逻辑）
     all_events = sorted(
         [("C", frame, speed) for frame, speed in contacts] +
         [("S", frame, speed) for frame, speed in separations],
         key=lambda x: x[1]  # 按帧索引排序
     )
-    
+
     for event in all_events:
         event_type, frame, speed = event
-        
+
         if event_type == "C":
             # 修正点：使用 speed 比较（索引应为 1）
             if not contact_candidates or speed < contact_candidates[-1][1]:
                 contact_candidates.append((frame, speed))
-        
+
         elif event_type == "S":
             if contact_candidates:
                 # 选择速度最小的 Contact（索引应为 1）
                 best_contact = min(contact_candidates, key=lambda x: x[1])
                 pairs.append((best_contact[0], frame))
                 contact_candidates = []
-    
+
     return pairs
 
 # Perform scene understanding on the frame
@@ -828,7 +856,7 @@ def create_frame_grid_with_keyframe(video_path, frame_indices, grid_size, minima
     spacer = 0
     video = cv2.VideoCapture(video_path)
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    
+
     frames = []
     for index in frame_indices:
         video.set(cv2.CAP_PROP_POS_FRAMES, index)
@@ -917,10 +945,10 @@ def image_resize_state(image, width=None):
 
 # def create_frame_grid_state(video_path, frame_indices):
 #     assert len(frame_indices) == 2, "frame_indices 必须包含两个元素"
-    
+
 #     video = cv2.VideoCapture(video_path)
 #     frames = []
-    
+
 #     for index in frame_indices:
 #         video.set(cv2.CAP_PROP_POS_FRAMES, index)
 #         success, frame = video.read()
@@ -929,22 +957,22 @@ def image_resize_state(image, width=None):
 #         else:
 #             frame = np.zeros((112, 200, 3), dtype=np.uint8)  # 生成黑色填充帧
 #         frames.append(frame)
-    
+
 #     video.release()
 #     # 确保两帧可用
 #     if len(frames) < 2:
 #         missing_frames = 2 - len(frames)
 #         black_frame = np.zeros_like(frames[0])
 #         frames.extend([black_frame] * missing_frames)
-    
+
 #     frame_height, frame_width = frames[0].shape[:2]
 #     grid_img = np.ones((frame_height, frame_width * 2, 3), dtype=np.uint8) * 255
-    
+
 #     # 左侧图像
 #     grid_img[:, :frame_width] = frames[0]
 #     # 右侧图像
 #     grid_img[:, frame_width:] = frames[1]
-    
+
 #     return grid_img
 
 
@@ -1139,7 +1167,7 @@ def process_task(
     #     """
     #     Instruction:
     #     - You will be given two frames: a previous frame (Frame Left) and a next frame (Frame Right). Your goal is to detect whether a Contact Moment, a Separation Moment, or Neither occurs based on the change in hand-object interaction between the two frames.
-        
+
     #     Definitions:
     #     - Contact: The hand is touching or making physical contact with the target object.
     #     - Separation: The hand is not touching the target object.
@@ -1156,7 +1184,7 @@ def process_task(
     #         - If Frame Left = Separation → Frame Right = Contact, output: Event: Contact
     #         - If Frame Left = Contact → Frame Right = Separation, output: Event: Separation
     #         - For all other combinations (Contact → Contact, Separation → Separation), output: Event: Neither
-        
+
     #     Output Format (Strict):
     #     - After completing your reasoning, output exactly one of the following as the final line:
     #         - "Event: Contact"
@@ -1164,7 +1192,7 @@ def process_task(
     #         - "Event: Neither"
     #     """
     # )
-    
+
     prompt_state = (
         """
         Instruction:
@@ -1195,7 +1223,7 @@ def process_task(
 
         """
     )
-    
+
     # prompt_state = (
     #     """
     #     Instruction:
@@ -1224,10 +1252,15 @@ def process_task(
     #     - "Event: Separation"
     #     """
     # )
-    
+
 # Iterate to narrow down the time
     video_name = os.path.splitext(os.path.basename(video_path))[0]
+    # 建一个按视频名分组的调试图目录,方便保存图片
+    debug_dir = Path("/home/EgoLoc/hand_data_drawer/debug_grids") / video_name
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
     json_path = get_json_path(video_name)
+    json_folder_path=get_json_folder_path(video_name)
     # 读取全部帧和速度
     with open(json_path, 'r') as f:
         all_data = json.load(f)
@@ -1235,10 +1268,10 @@ def process_task(
     all_speeds = np.array([x[1] for x in all_data])
     # 根据video_type选择极小值点提取函数
     if video_type == "short":
-        minima_indices = extract_local_minima_frames(video_name)
+        minima_indices = extract_local_minima_frames(video_name,json_folder_path)
         minima_speeds = [all_speeds[np.where(all_frames == idx)[0][0]] for idx in minima_indices]
     else:
-        minima_indices, minima_speeds = extract_local_minima_frames_adaptive(video_name)
+        minima_indices, minima_speeds = extract_local_minima_frames_adaptive(video_name,json_folder_path)
     print(f"{video_name}获取的极小值列表为:{minima_indices}")
     selected_frame_index = []
     while minima_indices:
@@ -1266,7 +1299,8 @@ def process_task(
             video_path,state_indices)
         image_RGB = cv2.cvtColor(image_state, cv2.COLOR_BGR2RGB)
         grid_image = Image.fromarray(image_RGB)
-        grid_image.save(f"/home/grid_EgoLoc.png")
+        #grid_image.save(f"/home/grid_EgoLoc.png")
+        grid_image.save(debug_dir / f"{video_name}_state.png")
         state = scene_understanding(
             credentials, image_state, prompt_state, principle = "state")
         print("判断其状态为：",state)
@@ -1277,12 +1311,13 @@ def process_task(
                 video_path,frame_indices,grid_size,minima_index)
             image_RGB1 = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             grid_image1 = Image.fromarray(image_RGB1)
-            grid_image1.save(f"/home/grid_EgoLoc1.png")
-            prompt = prompt_contact if state == "contact" else prompt_separation
+            #grid_image1.save(f"/home/grid_EgoLoc1.png")
+            grid_image1.save(debug_dir / f"{video_name}_keyframes.png")
+            prompt = prompt_contact if state == "Contact" else prompt_separation#统一为大写的contact
             description = scene_understanding(
                 credentials, image, prompt)
             if description:
-                if description != -1:     
+                if description != -1:
                     if int(description) - 1 > len(frame_indices) - 1:
                         print("Warning: Invalid frame index selected")
                         print(f"Selected frame index: {description}")
@@ -1343,30 +1378,30 @@ def calculate_max_mode_average(list_of_pairs_lists):
     """
     if not list_of_pairs_lists:
         return []
-    
+
     # 统计每组的对数
     pair_counts = [len(pairs) for pairs in list_of_pairs_lists]
     if not pair_counts:
         return []
-    
+
     max_count = max(pair_counts)
     if max_count == 0:
         return []
-    
+
     # 筛选出具有最大对数的实验组
     max_mode_groups = [pairs for pairs in list_of_pairs_lists if len(pairs) == max_count]
-    
+
     # 按位置对齐各组帧对并求平均
     averaged_pairs = []
     for grouped_pairs in zip(*max_mode_groups):
         contacts = [contact for contact, _ in grouped_pairs]
         separations = [separation for _, separation in grouped_pairs]
-        
+
         avg_contact = round(sum(contacts) / len(contacts))
         avg_separation = round(sum(separations) / len(separations))
-        
+
         averaged_pairs.append((avg_contact, avg_separation))
-    
+
     return averaged_pairs
 
 
@@ -1389,7 +1424,7 @@ def convert_video(video_file_path: str, action: str, credentials, grid_size: int
         speed_data = json.load(f)
     pair = get_contact_separation_pairs(results, speed_data)
     return pair
-    
+
 
 
 parser = argparse.ArgumentParser()
@@ -1408,7 +1443,7 @@ if not all(key in credentials for key in required_keys):
     raise ValueError("Required keys are missing in the credentials file")
 render_pos = 'topright'  # center or topright
 grid_size = int(pargs.grid)
-video_folder = "/home/hand_data_drawer/video_rgb"
+video_folder = "/home/EgoLoc/hand_data_drawer/video_rgb"
 action = pargs.action
 video_type = pargs.video_type
 folder_name = action.replace(" ", "_")
@@ -1417,12 +1452,13 @@ output_folder = f"results/{folder_name}"
 if __name__ == "__main__":
         # 获取文件夹中的所有 MP4 文件并按顺序排序
     video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
-    save_path = "/home/EgoLocx/ManiTIL_prompt/drawer_grid4.json"
+    save_path = "/home/EgoLoc/ManiTIL_prompt/drawer_grid4.json"
+    speed_output_root = "/home/EgoLoc/hand_data_drawer/3D_hand_speed_hamer"
     # save_path = "/home/VLM-Video-Action-Localization-main/VLM-Video-Action-Localization-main/result/greedyVLM_drawer_grid5.json"
     # 排序视频文件，基于文件名中 'c' 后的数字部分
     sorted_video_files = sorted(video_files, key=lambda x: int(x.split('.')[0][5:]))
     all_predictions = load_predictions(save_path)
-
+    batch_process_videos(video_folder, speed_output_root, device="cuda", encoder="vits")#后续添加对已有文件的跳过
     processed_video_files = {prediction[0] for prediction in all_predictions}
 
     # 按顺序遍历视频文件
@@ -1437,7 +1473,7 @@ if __name__ == "__main__":
                 pair = convert_video(
                     video_path, action, credentials, grid_size, video_type=video_type, max_feedback=1)
                 list_of_pair.append(pair)
-            
+
             averaged_pairs = calculate_max_mode_average(list_of_pair)
 
             if len(averaged_pairs) == 0:
@@ -1448,7 +1484,7 @@ if __name__ == "__main__":
                 all_predictions.append([video_file, averaged_pairs])
 
             save_predictions(all_predictions, save_path)
-    
+
     if video_type == "short":
         result = evaluate_predictions(
             json_path=save_path,
@@ -1456,14 +1492,14 @@ if __name__ == "__main__":
             sheet_name="Sheet9"  # 你也可以换其他sheet
         )
         print(result)
-    
+
     elif video_type == "long":
         results = evaluate_all(
             pred_json=save_path,
-            gt_xlsx="/home/KitchenCounter1.xlsx",
-            sheet_name="hand_data_drawer",
-            sr_tolerances=(1,3,5), 
-            psr_tolerance=10     
+            gt_xlsx="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
+            sheet_name="hand_data_cabinet",
+            sr_tolerances=(1,3,5),
+            psr_tolerance=10
         )
         print("Evaluation Results:")
         for k, v in results.items():

@@ -32,6 +32,29 @@ from typing import List, Dict, Tuple, Optional, Any
 import sys
 sys.path.append("/home/EgoLoc/hamer")
 
+#确保路径正确的处理
+# ---- 放在脚本最顶部：在所有 import 之前 ----
+import os, sys
+
+# 注意：用直引号，不要用中文/弯引号
+MMPOSE_ROOT = "/home/EgoLoc/mmpose/mmpose-0.x"   # 这里应该是包含 mmpose/ 包的仓库根目录
+HAMER_ROOT  = "/home/EgoLoc/hamer"               # 这里是 hamer 项目根目录
+
+# 1) 设置 PYTHONPATH（等价于 export PYTHONPATH="...:$PYTHONPATH"）
+paths = [MMPOSE_ROOT, HAMER_ROOT]
+old = os.environ.get("PYTHONPATH", "")
+os.environ["PYTHONPATH"] = ":".join([p for p in paths if p]) + (":" + old if old else "")
+
+# 2) 同步加到 sys.path，确保本进程内的 import 立刻可用
+for p in paths:
+    if p and p not in sys.path:
+        sys.path.insert(0, p)
+
+# （可选）调试输出，确认生效
+# print("PYTHONPATH =", os.environ["PYTHONPATH"])
+# print("sys.path head =", sys.path[:5])
+
+
 try:
     import torch
 except ImportError:  # Allow import on machines without torch
@@ -468,7 +491,8 @@ def determine_by_speed(credentials, video_path, action, grid_size, total_frames,
         flag="speed",
     )
 
-
+#二次确认状态
+#先用语义状态确认当前候选是否满足“接触/分离”的判定；若无需改变，再用速度规则兜底微调
 def feedback_contact(credentials, video_path, action, grid_size, total_frames, frame_start, max_fb, anchor, speed_folder):
     cnt = 0
     cur = frame_start
