@@ -1,5 +1,5 @@
 # export HF_ENDPOINT=https://hf-mirror.com
-# python ./EgoLoc_long.py --credentials auth.env  --grid_size 4  --video_type long
+# python ./EgoLoc_long_twohands.py --credentials auth.env  --grid_size 4  --video_type long
 
 import numpy as np
 import cv2
@@ -38,28 +38,198 @@ _model = load_model(
     "/home/EgoLoc/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"  # 直接放在weights目录外
 )
 
+def _load_speed_scalar(json_path: str, hand: str = "right"):
+    """
+    把双手速度文件解析成 (frame, speed_scalar) 列表。
+    支持两种格式：
+      1) 旧单手: [frame, speed]
+      2) 新双手: [frame, vL, vR]
 
-def run_groundingdino_and_crop(
-        image: np.ndarray,
-        text_prompt: str = "hand",
-        box_thresh: float = 0.35,
-        text_thresh: float = 0.25,
-        expand_pixels: int = 10
-) -> np.ndarray:
+    hand:
+      - "left"  : 用 vL
+      - "right" : 用 vR
+      - "min"   : min(vL, vR)
+      - "max"   : max(vL, vR)
+      - "avg"   : 0.5*(vL+vR)
     """
-    - 输入：OpenCV 读出的 BGR np.ndarray (H x W x C)
-    - 输出：裁剪并 resize 回原始 HxW 的 BGR np.ndarray
-    - expand_pixels: 裁剪框扩大的像素值
-    """
+    if not os.path.isfile(json_path):
+        print(f"❗ 文件未找到: {json_path}")
+        return []
+
+    with open(json_path, "r") as f:
+        raw = json.load(f)
+
+    data = []
+    for row in raw:
+        if not isinstance(row, (list, tuple)):
+            continue
+
+        if len(row) == 2:
+            # 旧格式: [frame, speed]
+            frame, speed = row
+        elif len(row) >= 3:
+            # 新格式: [frame, vL, vR, ...]
+            frame, vL, vR = row[:3]
+            if hand == "left":
+                speed = vL
+            elif hand == "right":
+                speed = vR
+            elif hand == "min":
+                speed = min(vL, vR)
+            elif hand == "max":
+                speed = max(vL, vR)
+            elif hand == "avg":
+                speed = 0.5 * (vL + vR)
+            else:
+                speed = vR  # 默认右手
+        else:
+            continue
+
+        try:
+            frame = int(frame)
+            speed = float(speed)
+        except Exception:
+            continue
+
+        data.append((frame, speed))
+
+    return data
+import numpy as np
+import cv2
+import tempfile
+
+def _xyxy_from_cxcywh_norm(box, W, H):
+    cx, cy, bw, bh = box
+    x0 = int((cx - bw/2) * W)
+    y0 = int((cy - bh/2) * H)
+    x1 = int((cx + bw/2) * W)
+    y1 = int((cy + bh/2) * H)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(W, x1), min(H, y1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [x0, y0, x1, y1]
+
+def _box_center_xy(box):
+    x0,y0,x1,y1 = box
+    return ((x0+x1)/2.0, (y0+y1)/2.0)
+
+def _iou(a, b):
+    ax0,ay0,ax1,ay1 = a
+    bx0,by0,bx1,by1 = b
+    ix0,iy0 = max(ax0,bx0), max(ay0,by0)
+    ix1,iy1 = min(ax1,bx1), min(ay1,by1)
+    iw, ih = max(0, ix1-ix0), max(0, iy1-iy0)
+    inter = iw*ih
+    area_a = (ax1-ax0)*(ay1-ay0)
+    area_b = (bx1-bx0)*(by1-by0)
+    union = area_a + area_b - inter + 1e-6
+    return inter / union
+
+def _expand_xyxy(box, W, H, expand_pixels=10, expand_ratio=None):
+    x0,y0,x1,y1 = box
+    if expand_ratio is not None:
+        w = x1 - x0
+        h = y1 - y0
+        ex = int(w * expand_ratio)
+        ey = int(h * expand_ratio)
+    else:
+        ex = ey = int(expand_pixels)
+    x0 = max(0, x0 - ex); y0 = max(0, y0 - ey)
+    x1 = min(W, x1 + ex); y1 = min(H, y1 + ey)
+    return [x0,y0,x1,y1]
+# def run_groundingdino_and_crop(
+#         image: np.ndarray,
+#         text_prompt: str = "hand",
+#         box_thresh: float = 0.35,
+#         text_thresh: float = 0.25,
+#         expand_pixels: int = 10
+# ) -> np.ndarray:
+#     """
+#     - 输入：OpenCV 读出的 BGR np.ndarray (H x W x C)
+#     - 输出：裁剪并 resize 回原始 HxW 的 BGR np.ndarray
+#     - expand_pixels: 裁剪框扩大的像素值
+#     """
+#     H, W = image.shape[:2]
+#
+#     # 1) 将 np.ndarray → PIL, 再用 load_image + predict
+#     #    （GroundingDINO 只接受文件或 PIL，且内部会转 Tensor 到 GPU）
+#     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+#         cv2.imwrite(tmp.name, image)
+#         pil_img, tensor_img = load_image(tmp.name)
+#     if text_prompt == "left":
+#         text_prompt="left hand"
+#     if text_prompt == "right":
+#         text_prompt="right hand"
+#
+#     # 2) predict 得到归一化的 [cx,cy,w,h]
+#     boxes_norm, logits, phrases = predict(
+#         model=_model,
+#         image=tensor_img,
+#         caption=text_prompt,
+#         box_threshold=box_thresh,
+#         text_threshold=text_thresh
+#     )
+#     # 如果没检测到
+#     if len(boxes_norm) == 0:
+#         return image
+#
+#     # 3) 转回像素坐标并筛选合法框
+#     boxes_px = []
+#     for cx, cy, bw, bh in boxes_norm:
+#         x0 = (cx - bw / 2) * W
+#         y0 = (cy - bh / 2) * H
+#         x1 = (cx + bw / 2) * W
+#         y1 = (cy + bh / 2) * H
+#         # 强制转换为 int，并做边界裁剪
+#         x0, y0, x1, y1 = map(int, [x0, y0, x1, y1])
+#         x0, y0 = max(0, x0), max(0, y0)
+#         x1, y1 = min(W, x1), min(H, y1)
+#         if x1 > x0 and y1 > y0:
+#             boxes_px.append([x0, y0, x1, y1])
+#
+#     if not boxes_px:
+#         # 没有合法框，直接返回原图
+#         return image
+#
+#     # 4) 选择面积最小的框
+#     areas = [(x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in boxes_px]
+#     idx_min = int(np.argmin(areas))
+#     x0, y0, x1, y1 = boxes_px[idx_min]
+#
+#     # 5) 扩大裁剪框（上下左右各扩大expand_pixels像素）
+#     x0_expanded = max(0, x0 - expand_pixels)
+#     y0_expanded = max(0, y0 - expand_pixels)
+#     x1_expanded = min(W, x1 + expand_pixels)
+#     y1_expanded = min(H, y1 + expand_pixels)
+#
+#     # 6) 裁剪 + resize 回原图
+#     crop = image[y0_expanded:y1_expanded, x0_expanded:x1_expanded]
+#     if crop.size == 0:
+#         return image
+#     resized = cv2.resize(crop, (W, H), interpolation=cv2.INTER_LINEAR)
+#     return resized
+def run_groundingdino_and_crop_stable(
+    image: np.ndarray,
+    hand: str = "right",               # "left" / "right" / "both"
+    box_thresh: float = 0.35,
+    text_thresh: float = 0.25,
+    expand_pixels: int = 10,
+    expand_ratio: float = 0.2,         # 推荐用比例扩张更稳
+    mirror: bool = False,              # 镜像视频把左右对调
+    prev_box: Optional[List[int]] = None,  # ✅ 改这里     # 上一帧该手的 box，用于稳定
+):
     H, W = image.shape[:2]
-
-    # 1) 将 np.ndarray → PIL, 再用 load_image + predict
-    #    （GroundingDINO 只接受文件或 PIL，且内部会转 Tensor 到 GPU）
+    if hand == "left":
+        text_prompt="left hand"
+    if hand == "right":
+        text_prompt="right hand"
+    # 1) 写临时文件给 load_image（沿用你现有方式）
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         cv2.imwrite(tmp.name, image)
         pil_img, tensor_img = load_image(tmp.name)
 
-    # 2) predict 得到归一化的 [cx,cy,w,h]
+    # 2) 一次性检测所有 hand（不要用 left/right prompt）
     boxes_norm, logits, phrases = predict(
         model=_model,
         image=tensor_img,
@@ -67,45 +237,57 @@ def run_groundingdino_and_crop(
         box_threshold=box_thresh,
         text_threshold=text_thresh
     )
-    # 如果没检测到
     if len(boxes_norm) == 0:
-        return image
+        return image, None  # 返回原图 + None
 
-    # 3) 转回像素坐标并筛选合法框
-    boxes_px = []
-    for cx, cy, bw, bh in boxes_norm:
-        x0 = (cx - bw / 2) * W
-        y0 = (cy - bh / 2) * H
-        x1 = (cx + bw / 2) * W
-        y1 = (cy + bh / 2) * H
-        # 强制转换为 int，并做边界裁剪
-        x0, y0, x1, y1 = map(int, [x0, y0, x1, y1])
-        x0, y0 = max(0, x0), max(0, y0)
-        x1, y1 = min(W, x1), min(H, y1)
-        if x1 > x0 and y1 > y0:
-            boxes_px.append([x0, y0, x1, y1])
+    # 3) 转成像素框，并带上分数（logit）
+    candidates = []
+    for k, b in enumerate(boxes_norm):
+        box = _xyxy_from_cxcywh_norm(b, W, H)
+        if box is None:
+            continue
+        score = float(logits[k]) if logits is not None and len(logits) > k else 0.0
+        candidates.append((box, score))
 
-    if not boxes_px:
-        # 没有合法框，直接返回原图
-        return image
+    if not candidates:
+        return image, None
 
-    # 4) 选择面积最小的框
-    areas = [(x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in boxes_px]
-    idx_min = int(np.argmin(areas))
-    x0, y0, x1, y1 = boxes_px[idx_min]
+    # 4) 如果给了 prev_box：优先选 IoU 最大/距离最近的，避免左右互换
+    if prev_box is not None and len(candidates) >= 1:
+        candidates.sort(key=lambda bs: (_iou(bs[0], prev_box), bs[1]), reverse=True)
+        chosen = candidates[0][0]
+    else:
+        # 5) 否则：按 x 中心排序分左右（画面坐标）
+        candidates.sort(key=lambda bs: _box_center_xy(bs[0])[0])  # 从左到右
+        left_box = candidates[0][0]
+        right_box = candidates[-1][0]
 
-    # 5) 扩大裁剪框（上下左右各扩大expand_pixels像素）
-    x0_expanded = max(0, x0 - expand_pixels)
-    y0_expanded = max(0, y0 - expand_pixels)
-    x1_expanded = min(W, x1 + expand_pixels)
-    y1_expanded = min(H, y1 + expand_pixels)
+        if mirror:
+            # 镜像视频：左右对调
+            left_box, right_box = right_box, left_box
 
-    # 6) 裁剪 + resize 回原图
-    crop = image[y0_expanded:y1_expanded, x0_expanded:x1_expanded]
+        if hand == "left":
+            chosen = left_box
+        elif hand == "right":
+            chosen = right_box
+        elif hand == "both":
+            # 两只手一起：取 union 框，把两只手都框住（给 VLM 更稳）
+            x0 = min(left_box[0], right_box[0])
+            y0 = min(left_box[1], right_box[1])
+            x1 = max(left_box[2], right_box[2])
+            y1 = max(left_box[3], right_box[3])
+            chosen = [x0,y0,x1,y1]
+        else:
+            chosen = right_box
+
+    # 6) 扩张框 + 裁剪 + resize 回原分辨率
+    chosen = _expand_xyxy(chosen, W, H, expand_pixels=expand_pixels, expand_ratio=expand_ratio)
+    x0,y0,x1,y1 = chosen
+    crop = image[y0:y1, x0:x1]
     if crop.size == 0:
-        return image
+        return image, None
     resized = cv2.resize(crop, (W, H), interpolation=cv2.INTER_LINEAR)
-    return resized
+    return resized, chosen
 
 
 def is_positive_feedback(feedback_result):
@@ -178,7 +360,7 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
     min_peak_distance = 5  # 极小值间最小间隔（单位：帧）
     savgol_window_ratio = 0.2
 
-    filename = f"{video_path}_with_speed.json"
+    filename = f"{video_path}_with_speed_twohands.json"
     file_path = os.path.join(folder_path, filename)
     if not os.path.isfile(file_path):
         print(f"❗ 文件未找到: {file_path}")
@@ -267,7 +449,8 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
     spline_s = 1e-4  # 样条插值平滑因子
     savgol_mode = 'nearest'  # 滤波模式
 
-    json_filename = f"{video_path}_with_speed.json"
+    #json_filename = f"{video_path}_with_speed.json"
+    json_filename = f"{video_path}_with_speed_twohands.json"
     file_path = os.path.join(folder_path, json_filename)
     if not os.path.isfile(file_path):
         print(f"❗ 文件未找到: {file_path}")
@@ -401,77 +584,423 @@ def adaptive_sample(minima_indices, mode='linear', exp_k=0.5):
     return selected_frame
 
 
+# def extract_local_minima_frames_adaptive(
+#         video_path,
+#         folder_path="/home/EgoLoc/hand_data_drawer/twohands_test_out15",
+#         # folder_path="/home/bathroomCabinet/3D_hand_speed",
+#         output_folder="./vis_speed_curve",
+#         hand="right",
+# ):
+#     """
+#     自适应版：根据总帧数和速度自动设置四个关键参数并提取极小值帧。
+#     返回：极小值帧list、极小值帧对应速度list
+#     """
+#     # json_file = os.path.join(folder_path, f"{video_path}_with_speed_twohands.json")
+#     # if not os.path.isfile(json_file):
+#     #     print(f"❗ 文件未找到: {json_file}")
+#     #     return [], []
+#     # data = json.load(open(json_file, 'r'))
+#     json_file = os.path.join(folder_path, f"{video_path}_with_speed_twohands.json")
+#     if not os.path.isfile(json_file):
+#         print(f"❗ 文件未找到: {json_file}")
+#         return [], []
+#
+#     data = _load_speed_scalar(json_file, hand=hand)
+#     # print(data)
+#     if not isinstance(data, list) or len(data) == 0:
+#         print(f"❗ 数据为空或格式错误")
+#         return [], []
+#
+#     frames_all, speeds_all = zip(*data)
+#     frames_all = np.array(frames_all, float)
+#     speeds_all = np.array(speeds_all, float)
+#
+#     mask = np.isfinite(speeds_all) & (speeds_all > 0)
+#     frames = frames_all[mask]
+#     speeds = speeds_all[mask]
+#     N = len(speeds)
+#     if N < 4:
+#         print(f"⚠️ 有效数据太少: {N}")
+#         return [], []
+#
+#     #polyorder = max(2, int(N / 13))
+#     #修改Savitzky-Golay 输出全变成 ~0
+#     polyorder = min(3, max(2, int(N / 100)))  # 但无论如何 ≤3
+#     window_length = max(8, int(N / 7))
+#     if window_length % 2 == 0: window_length += 1
+#     window_length = min(window_length, N - (1 if N % 2 == 0 else 0))
+#     mean_speed = np.mean(speeds)
+#     spline_s = mean_speed * 1e-3
+#     min_prominence = mean_speed * 0.3
+#     min_peak_distance = max(int(N * 0.03), 2)
+#     try:
+#         speeds_sg = savgol_filter(
+#             speeds, window_length=window_length,
+#             polyorder=min(polyorder, window_length - 1), mode='nearest'
+#         )
+#     except:
+#         speeds_sg = speeds
+#     try:
+#         spl = UnivariateSpline(frames, speeds_sg, s=spline_s)
+#         frames_smooth = np.linspace(frames.min(), frames.max(), max(300, N))
+#         speeds_smooth = spl(frames_smooth)
+#     except:
+#         frames_smooth, speeds_smooth = frames, speeds_sg
+#     peaks, props = find_peaks(
+#         -speeds_smooth,
+#         prominence=min_prominence,
+#         distance=min_peak_distance
+#     )
+#     cand_frames = np.unique(np.rint(frames_smooth[peaks]).astype(int))
+#     pairs = []
+#     for f in cand_frames:
+#         idx = np.argmin(np.abs(frames - f))
+#         pairs.append((int(frames[idx]), float(speeds[idx])))
+#     pairs.sort(key=lambda x: x[1])
+#     selected = []
+#     for f, s in pairs:
+#         if all(abs(f - sf) >= min_peak_distance for sf, _ in selected):
+#             selected.append((f, s))
+#     result = [f for f, s in selected]
+#     result_speeds = [s for f, s in selected]
+#     print(f"🖨️ {video_path}提取到极小值帧（{len(result)}个）： {result}")
+#     return result, result_speeds
+import os
+import json
+import numpy as np
+import cv2
+from typing import List, Tuple
+from scipy.signal import savgol_filter
+import matplotlib.pyplot as plt
+
 def extract_local_minima_frames_adaptive(
         video_path,
-        folder_path="/home/EgoLoc/hand_data_drawer/3D_hand_speed_hamer",
-        # folder_path="/home/bathroomCabinet/3D_hand_speed",
-        output_folder="./vis_speed_curve"
-):
+        folder_path="/home/EgoLoc/hand_data_drawer/twohands_test_out15",
+        output_folder="./vis_speed_curve",
+        hand="right",
+) -> Tuple[List[int], List[float]]:
     """
-    自适应版：根据总帧数和速度自动设置四个关键参数并提取极小值帧。
-    返回：极小值帧list、极小值帧对应速度list
+    自适应版：使用
+      1) 局部窗口极小值 + robust 阈值（中位数 + MAD）
+      2) 先在强平滑曲线上找候选，再在原始曲线上局部精修
+      3) 所有时间尺度参数由 fps 决定（而不是 N）
+
+    参数：
+        video_path: 可以是视频文件路径，或仅仅是 video_name（不含扩展名）。
+                    - 用于推测 JSON 文件名时只取 basename 的 stem。
+                    - 如果是实际视频文件路径，会尝试用 OpenCV 读取 fps。
+        folder_path: 存放 `<video_stem>_with_speed_twohands.json` 的目录
+        output_folder: 可视化输出目录（会保存速度曲线 + 极小值点）
+        hand: "left" or "right" —— 传给 _load_speed_scalar
+
+    返回：
+        result: 极小值帧号列表（以你 JSON 里的 frame index 为准，一般是 0-based）
+        result_speeds: 对应帧的速度
     """
-    json_file = os.path.join(folder_path, f"{video_path}_with_speed.json")
+
+    # -------- 0. 解析 video_stem + JSON 路径 --------
+    video_basename = os.path.basename(video_path)
+    video_stem, _ext = os.path.splitext(video_basename)   # "xxx.mp4" -> "xxx"
+    json_file = os.path.join(folder_path, f"{video_stem}_with_speed_twohands.json")
+
     if not os.path.isfile(json_file):
         print(f"❗ 文件未找到: {json_file}")
         return [], []
-    data = json.load(open(json_file, 'r'))
+
+    # 这里沿用你之前的工具函数，hand="left" 或 "right" 决定取哪一列速度
+    data = _load_speed_scalar(json_file, hand=hand)
     if not isinstance(data, list) or len(data) == 0:
         print(f"❗ 数据为空或格式错误")
         return [], []
 
+    # data: [[frame, speed], ...]
     frames_all, speeds_all = zip(*data)
-    frames_all = np.array(frames_all, float)
-    speeds_all = np.array(speeds_all, float)
+    frames_all = np.array(frames_all, dtype=float)
+    speeds_all = np.array(speeds_all, dtype=float)
 
-    mask = np.isfinite(speeds_all) & (speeds_all > 0)
-    frames = frames_all[mask];
-    speeds = speeds_all[mask]
+    # # 丢掉 speed <= 0 或 非有限值
+    # mask = np.isfinite(speeds_all) & (speeds_all > 0)
+    # frames = frames_all[mask]
+    # speeds = speeds_all[mask]
+    # N = len(speeds)
+    # -------- 数据清洗：去掉无效值 + 去掉 speed>30 的异常点 --------
+    # 你也可以把 30 抽成参数 max_speed=30.0
+    max_speed = 30.0
+
+    mask = np.isfinite(speeds_all) & (speeds_all > 0) & (speeds_all <= max_speed)
+    frames = frames_all[mask].astype(int)
+    speeds = speeds_all[mask].astype(float)
+
+    # 保险：按 frame 排序（JSON 不一定严格有序）
+    order = np.argsort(frames)
+    frames = frames[order]
+    speeds = speeds[order]
+
+    # 保险：如果同一帧出现多条记录（少见，但可能），取最小速度或均值都行
+    # 这里取最小速度，更偏向捕捉“停顿”
+    uniq_frames = []
+    uniq_speeds = []
+    i = 0
+    while i < len(frames):
+        f = frames[i]
+        j = i
+        vals = []
+        while j < len(frames) and frames[j] == f:
+            vals.append(speeds[j])
+            j += 1
+        uniq_frames.append(f)
+        uniq_speeds.append(np.min(vals))
+        i = j
+    frames = np.array(uniq_frames, dtype=int)
+    speeds = np.array(uniq_speeds, dtype=float)
+
+    N_raw = len(speeds)
+    if N_raw < 4:
+        print(f"⚠️ 有效数据太少（过滤speed>30后）: {N_raw}")
+        return [], []
+
+    # -------- 在真实帧轴上插值：补齐成每一帧一个速度 --------
+    f_min, f_max = int(frames[0]), int(frames[-1])
+    frames_full = np.arange(f_min, f_max + 1, dtype=int)
+
+    # 线性插值（np.interp 会自动处理缺失帧；两端用端点值外推）
+    speeds_full = np.interp(frames_full, frames, speeds)
+
+    # 如果你不想两端“外推成常数”，可以选择只保留原始范围内（其实 frames_full 就是原始范围）
+    # speeds_full = np.interp(frames_full, frames, speeds, left=np.nan, right=np.nan)  # 需要后续处理nan
+
+    frames = frames_full.astype(float)  # 后续你的代码用 float 做 abs(frame-fi) 没问题
+    speeds = speeds_full.astype(float)
     N = len(speeds)
+
     if N < 4:
         print(f"⚠️ 有效数据太少: {N}")
         return [], []
 
-    polyorder = max(2, int(N / 13))
-    window_length = max(8, int(N / 7))
-    if window_length % 2 == 0: window_length += 1
-    window_length = min(window_length, N - (1 if N % 2 == 0 else 0))
-    mean_speed = np.mean(speeds)
-    spline_s = mean_speed * 1e-3
-    min_prominence = mean_speed * 0.3
-    min_peak_distance = max(int(N * 0.03), 2)
+    # -------- 1. 估计 fps（用于把“秒”换成“帧数”） --------
+    fps = 30.0  # 默认
     try:
-        speeds_sg = savgol_filter(
-            speeds, window_length=window_length,
-            polyorder=min(polyorder, window_length - 1), mode='nearest'
-        )
-    except:
-        speeds_sg = speeds
-    try:
-        spl = UnivariateSpline(frames, speeds_sg, s=spline_s)
-        frames_smooth = np.linspace(frames.min(), frames.max(), max(300, N))
-        speeds_smooth = spl(frames_smooth)
-    except:
-        frames_smooth, speeds_smooth = frames, speeds_sg
-    peaks, props = find_peaks(
-        -speeds_smooth,
-        prominence=min_prominence,
-        distance=min_peak_distance
-    )
-    cand_frames = np.unique(np.rint(frames_smooth[peaks]).astype(int))
-    pairs = []
-    for f in cand_frames:
-        idx = np.argmin(np.abs(frames - f))
-        pairs.append((int(frames[idx]), float(speeds[idx])))
-    pairs.sort(key=lambda x: x[1])
-    selected = []
-    for f, s in pairs:
-        if all(abs(f - sf) >= min_peak_distance for sf, _ in selected):
-            selected.append((f, s))
+        cap_fps = cv2.VideoCapture(video_path)
+        if cap_fps.isOpened():
+            fps_val = cap_fps.get(cv2.CAP_PROP_FPS)
+            if fps_val and fps_val > 1e-3:
+                fps = float(fps_val)
+        cap_fps.release()
+    except Exception as e:
+        # 如果 video_path 不是实际视频文件，或者读取失败，就用默认 30fps
+        pass
+
+    # 你可以根据实际情况调这个
+    # 典型设定：Savitzky-Golay 轻平滑窗口 ~0.3s，强平滑窗口 ~0.7s
+    mild_win_time = 0.3   # 秒
+    strong_win_time = 0.4 # 秒
+    min_peak_distance_time = 0.12  # 两个极小值之间至少间隔 0.5 秒
+    coarse_neighborhood_time = 0.4  # 判定“局部极小”时的邻域宽度
+    refine_neighborhood_time = 0.07  # 在原始曲线上精修时的邻域宽度
+
+    # 换算成帧数（使用“帧号差值”，不是有效样本 index）
+    min_peak_distance_frames = max(1, int(min_peak_distance_time * fps))
+    coarse_neighborhood_frames = max(1, int(coarse_neighborhood_time * fps))
+    refine_neighborhood_frames = max(1, int(refine_neighborhood_time * fps))
+
+    # -------- 2. Savitzky-Golay 轻平滑 + 强平滑 --------
+    def _sg_smooth(x, win_time, polyorder=3):
+        """按时间窗口长度（秒）设置 Savitzky-Golay 的窗口，并做好边界检查。"""
+        if len(x) < 5:
+            return x.copy()
+        win = int(win_time * fps)
+        if win < 3:
+            win = 3
+        if win % 2 == 0:
+            win += 1
+        # 最大不能超过 N（且必须是奇数）
+        if win > len(x):
+            win = len(x) if len(x) % 2 == 1 else len(x) - 1
+        if win < 3:
+            return x.copy()
+        poly = min(polyorder, win - 1)
+        try:
+            return savgol_filter(x, window_length=win, polyorder=poly, mode='nearest')
+        except Exception:
+            return x.copy()
+
+    speeds_mild = _sg_smooth(speeds, mild_win_time)
+    speeds_strong = _sg_smooth(speeds_mild, strong_win_time)
+
+    # -------- 3. robust 阈值（中位数 + MAD） --------
+    med = np.median(speeds_strong)
+    mad = np.median(np.abs(speeds_strong - med))
+    if mad < 1e-6:
+        # 如果 MAD 非常小，就退化用 std
+        mad = np.std(speeds_strong) + 1e-6
+
+    # “明显比整体慢”的阈值：越小越严格
+    alpha = 0.8  # 你可以在 0.5~1.5 之间调
+    slow_thr = med - alpha * mad
+    slow_thr = max(0.0, slow_thr)  # 速度不能 < 0
+
+    # # -------- 4. 在强平滑曲线上找“局部窗口极小值”作为候选 --------
+    # candidate_indices = []
+    # for i in range(N):
+    #     fi = frames[i]  # 真实帧号（0-based）
+    #     # 在“真实帧号”意义下的临近窗口：|frame - fi| <= coarse_neighborhood_frames
+    #     local_mask = np.abs(frames - fi) <= coarse_neighborhood_frames
+    #     local_vals = speeds_strong[local_mask]
+    #     if local_vals.size == 0:
+    #         continue
+    #
+    #     val_i = speeds_strong[i]
+    #     # 条件1：在这个窗口内是最小值
+    #     # if val_i > local_vals.min() + 1e-8:
+    #     #     continue
+    #     eps = 0.05 * np.median(speeds_strong)  # 或者固定 eps=0.05
+    #     if val_i > local_vals.min() + eps:
+    #         continue
+    #
+    #     # 条件2：比整体显著慢
+    #     # if val_i > slow_thr:
+    #     #     continue
+    #
+    #     candidate_indices.append(i)
+    #
+    # if not candidate_indices:
+    #     print(f"⚠️ {video_stem} 未找到局部候选极小值（强平滑曲线）")
+    #     return [], []
+    from scipy.signal import find_peaks
+
+    # ---------- 4) 在强平滑曲线上找极小值候选：find_peaks(-x) ----------
+    x = speeds_strong.copy()
+
+    # 自适应 prominence：用 MAD 或 std 做尺度
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    if mad < 1e-6:
+        mad = np.std(x) + 1e-6
+
+    # prominence 取一个“不会太严”的值：你可以从 0.3~1.0 之间调
+    prom_k = 0.4
+    min_prom = prom_k * mad
+
+    # distance：建议别用 0.12s 那么大，先小一点防漏检（比如 2~5 帧）
+    min_peak_distance_frames = max(1, int(min_peak_distance_time * fps))
+    min_peak_distance_frames = min(min_peak_distance_frames, 5)  # 防止过大漏掉密集谷
+
+    # 直接在 -x 上找谷
+    peaks, props = find_peaks(-x, prominence=min_prom, distance=min_peak_distance_frames)
+
+    candidate_indices = peaks.tolist()
+
+    # ---------- 4.1) 兜底：导数过零（补平台谷/浅谷） ----------
+    dx = np.diff(x)
+    sign = np.sign(dx)
+    # 从负到正：谷（极小）
+    zc = np.where((sign[:-1] < 0) & (sign[1:] > 0))[0] + 1
+    candidate_indices += zc.tolist()
+
+    candidate_indices = sorted(set(int(i) for i in candidate_indices if 0 <= i < N))
+
+    if not candidate_indices:
+        print(f"⚠️ {video_stem} 未找到候选极小值（find_peaks + zero-cross）")
+        return [], []
+
+    # ---------- 5) refine：回到原始 speeds（或 mild）在局部找真正最小 ----------
+    refine_neighborhood_frames = max(1, int(refine_neighborhood_time * fps))
+
+    refined_pairs = []
+    for idx_c in candidate_indices:
+        fc = frames[idx_c]
+        refine_mask = np.abs(frames - fc) <= refine_neighborhood_frames
+        if not np.any(refine_mask):
+            continue
+
+        local_frames = frames[refine_mask]
+        # 推荐用 speeds（原始插值后）或 speeds_mild（二者二选一）
+        local_speeds = speeds[refine_mask]  # 或者 speeds_mild[refine_mask]
+
+        j = int(np.argmin(local_speeds))
+        f_ref = int(local_frames[j])
+        s_ref = float(local_speeds[j])
+        refined_pairs.append((f_ref, s_ref))
+
+    if not refined_pairs:
+        print(f"⚠️ {video_stem} 候选极小值 refine 后为空")
+        return [], []
+
+    # -------- 5. 在原始曲线上做局部精修（refine） --------
+    refined_pairs = []  # (frame_refined, speed_refined)
+    for idx_c in candidate_indices:
+        fc = frames[idx_c]
+        # 在“真实帧号”意义下 ±refine_neighborhood_frames 范围内找原始速度的最小值
+        refine_mask = np.abs(frames - fc) <= refine_neighborhood_frames
+        if not np.any(refine_mask):
+            continue
+        local_frames = frames[refine_mask]
+        local_speeds = speeds[refine_mask]
+
+        j_local_min = np.argmin(local_speeds)
+        f_ref = int(local_frames[j_local_min])
+        s_ref = float(local_speeds[j_local_min])
+        refined_pairs.append((f_ref, s_ref))
+
+    if not refined_pairs:
+        print(f"⚠️ {video_stem} 候选极小值精修后为空")
+        return [], []
+
+    # 去重（同一帧可能被多次 refine 到）
+    # 先按帧号聚合，再取该帧最小速度
+    frame_to_speed = {}
+    for f, s in refined_pairs:
+        if f not in frame_to_speed or s < frame_to_speed[f]:
+            frame_to_speed[f] = s
+    pairs = sorted(frame_to_speed.items(), key=lambda x: x[1])  # 按速度从小到大排
+
+    # -------- 6. 按时间间隔做 NMS（min_peak_distance_frames） --------
+    # selected = []
+    # for f, s in pairs:
+    #     if all(abs(f - sf) >= min_peak_distance_frames for sf, _ in selected):
+    #         selected.append((f, s))
+    selected = pairs[:]  # 不做 NMS，全部保留
+
     result = [f for f, s in selected]
     result_speeds = [s for f, s in selected]
-    print(f"🖨️ {video_path}提取到极小值帧（{len(result)}个）： {result}")
+    print(f"🖨️ {video_stem}（{hand} hand）提取到极小值帧（{len(result)}个）： {result}")
+
+    # -------- 7. 可视化速度曲线 + 极小值点（可选） --------
+    try:
+        if output_folder is not None:
+            os.makedirs(output_folder, exist_ok=True)
+            plt.figure(figsize=(12, 4))
+            # 用 frames 做 x 轴，更符合真实时间
+            plt.plot(frames, speeds, label="raw speed", alpha=0.4)
+            plt.plot(frames, speeds_mild, label="mild smooth", linewidth=1.5)
+            plt.plot(frames, speeds_strong, label="strong smooth", linewidth=1.5)
+
+            # 画出选中的极小值点
+            if len(result) > 0:
+                sel_frames = np.array(result, dtype=float)
+                # 在 mild 曲线上取对应速度，仅用于可视化
+                vis_speeds = []
+                for f in sel_frames:
+                    # 找到离该帧最近的 index
+                    idx_near = np.argmin(np.abs(frames - f))
+                    vis_speeds.append(speeds_mild[idx_near])
+                plt.scatter(sel_frames, vis_speeds, c="red", marker="o", label="selected minima")
+
+            plt.xlabel("Frame index")
+            plt.ylabel("Speed")
+            plt.title(f"{video_stem} ({hand}) - local minima (fps≈{fps:.1f})")
+            plt.legend()
+            plt.tight_layout()
+
+            out_png = os.path.join(output_folder, f"{video_stem}_{hand}_local_minima.png")
+            plt.savefig(out_png)
+            plt.close()
+            print(f"🖼️ 速度曲线可视化已保存: {out_png}")
+    except Exception as e:
+        print(f"⚠️ 可视化保存失败: {e}")
+
     return result, result_speeds
+
 
 
 # 速度越小概率越高的采样
@@ -609,7 +1138,7 @@ def select_and_filter_keyframes_with_anchor(selected_indices, total_indices, gri
 
 
 # def get_json_path(video_name, base_dir="/home/hand/3D_hand_speed"):
-def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/3D_hand_right"):
+def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/twohands_test_out15"):
     # json_filename = f"{video_name}_with_speed.json"
     # json_path = os.path.join(base_dir, json_filename)
     # return json_path
@@ -619,11 +1148,12 @@ def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/3D_hand_ri
     """
     json_dir = os.path.join(base_dir, video_name)
     os.makedirs(json_dir, exist_ok=True)  # 确保目录存在（读/写都安全）
-    json_path = os.path.join(json_dir, f"{video_name}_with_speed.json")
+    #json_path = os.path.join(json_dir, f"{video_name}_with_speed.json")
+    json_path = os.path.join(json_dir, f"{video_name}_with_speed_twohands.json")
     return json_path
 
 
-def get_json_folder_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/3D_hand_right"):
+def get_json_folder_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/twohands_test_out15"):
     # json_filename = f"{video_name}_with_speed.json"
     # json_path = os.path.join(base_dir, json_filename)
     # return json_path
@@ -795,7 +1325,7 @@ def scene_understanding(credentials, frame, prompt_message, principle=None):
         params = {
             "model": "gpt-4o",
             "messages": PROMPT_MESSAGES,
-            "max_tokens": 200,
+            "max_tokens": 400,
             "temperature": 0.1,
             "top_p": 0.5,
             "frequency_penalty": 0.0,
@@ -810,9 +1340,9 @@ def scene_understanding(credentials, frame, prompt_message, principle=None):
         params = {
             "model": credentials["AZURE_OPENAI_DEPLOYMENT_NAME"],
             "messages": PROMPT_MESSAGES,
-            "max_tokens": 200,
-            "temperature": 0.1,
-            "top_p": 0.5,
+            "max_tokens": 500,
+            "temperature": 0.0,
+            "top_p": 1.0,
             "frequency_penalty": 0.0,
             "presence_penalty": 0.0,
         }
@@ -960,10 +1490,10 @@ def image_resize_state(image, width=None):
 
 # def create_frame_grid_state(video_path, frame_indices):
 #     assert len(frame_indices) == 2, "frame_indices 必须包含两个元素"
-
+#
 #     video = cv2.VideoCapture(video_path)
 #     frames = []
-
+#
 #     for index in frame_indices:
 #         video.set(cv2.CAP_PROP_POS_FRAMES, index)
 #         success, frame = video.read()
@@ -972,85 +1502,219 @@ def image_resize_state(image, width=None):
 #         else:
 #             frame = np.zeros((112, 200, 3), dtype=np.uint8)  # 生成黑色填充帧
 #         frames.append(frame)
-
+#
 #     video.release()
 #     # 确保两帧可用
 #     if len(frames) < 2:
 #         missing_frames = 2 - len(frames)
 #         black_frame = np.zeros_like(frames[0])
 #         frames.extend([black_frame] * missing_frames)
-
+#
 #     frame_height, frame_width = frames[0].shape[:2]
 #     grid_img = np.ones((frame_height, frame_width * 2, 3), dtype=np.uint8) * 255
-
+#
 #     # 左侧图像
 #     grid_img[:, :frame_width] = frames[0]
 #     # 右侧图像
 #     grid_img[:, frame_width:] = frames[1]
-
+#
 #     return grid_img
 
+#起始
+# def create_frame_grid_state(video_path, frame_indices, grid_size=None,hand="hand"):
+#     if grid_size is None:
+#         grid_size = (1, len(frame_indices))
+#     spacer = 0
+#     video = cv2.VideoCapture(video_path)
+#     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+#     frames = []
+#     prev = None  # 这个 grid 内保持一致（左/右手各自可以做 dict，这里先简化成单手）
+#     for idx in frame_indices:
+#         video.set(cv2.CAP_PROP_POS_FRAMES, idx)
+#         success, frame = video.read()
+#         if success:
+#             # 调整尺寸（保持宽度 400）
+#             frame = image_resize(frame, width=400)
+#             # 手部检测并裁剪，再缩放回当前尺寸
+#             # frame = run_groundingdino_and_crop(frame,text_prompt=hand)
+#             frame, prev = run_groundingdino_and_crop_stable(
+#                 frame, hand=hand, mirror=False, prev_box=prev,
+#                 expand_ratio=0.25, box_thresh=0.3
+#             )
+#             debug=True
+#             if debug and prev is not None:
+#                 # 在裁剪前的 frame 上画出 chosen box，方便看是否选对手
+#                 vis = frame.copy()
+#                 x0, y0, x1, y1 = prev
+#                 cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 0), 2)
+#                 cv2.putText(vis, f"{hand} @ frame {idx}", (10, 30),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+#                 frames.append(vis)
+#             else:
+#                 frames.append(cropped)
+#
+#             frames.append(frame)
+#         else:
+#             print(f"Warning: Frame {idx} not found (total {total_frames}). Using black frame.")
+#             # 使用与前面帧相同尺寸的黑帧
+#             black = np.zeros_like(frames[0] if frames else np.zeros((400, 400, 3), dtype=np.uint8))
+#             frames.append(black)
+#     video.release()
+#
+#     # 如果帧不足，填充黑帧
+#     total_needed = grid_size[0] * grid_size[1]
+#     if len(frames) < total_needed:
+#         missing = total_needed - len(frames)
+#         black = np.zeros_like(frames[0])
+#         frames.extend([black] * missing)
+#
+#     fh, fw = frames[0].shape[:2]
+#     gh = grid_size[0] * fh + (grid_size[0] - 1) * spacer
+#     gw = grid_size[1] * fw + (grid_size[1] - 1) * spacer
+#     grid_img = np.ones((gh, gw, 3), dtype=np.uint8) * 255
+#
+#     for i in range(grid_size[0]):
+#         for j in range(grid_size[1]):
+#             idx = i * grid_size[1] + j
+#             frame = frames[idx]
+#             # 渲染圆与数字
+#             # cX, cY = fw // 2, fh // 2
+#             # max_dim = int(min(fh, fw) * 0.5)
+#             # overlay = frame.copy()
+#             # if render_pos == 'center':
+#             #     center = (cX, cY)
+#             # else:
+#             #     center = (fw - max_dim//2, max_dim//2)
+#             # cv2.circle(overlay, center, max_dim//2, (255,255,255), -1)
+#             # frame = cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
+#             # cv2.circle(frame, center, max_dim//2, (255,255,255), 2)
+#             # # 文本
+#             # text = str(idx+1)
+#             # ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, max_dim/50, 2)[0]
+#             # if render_pos == 'center':
+#             #     tx = cX - ts[0]//2
+#             #     ty = cY + ts[1]//2
+#             # else:
+#             #     tx = fw - ts[0]//2 - max_dim//2
+#             #     ty = ts[1]//2 + max_dim//2
+#             # cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, max_dim/50, (0,0,0), 2)
+#
+#             y1 = i * (fh + spacer)
+#             y2 = y1 + fh
+#             x1 = j * (fw + spacer)
+#             x2 = x1 + fw
+#             grid_img[y1:y2, x1:x2] = frame
+#
+#     return grid_img
+#终止
+import math
+import numpy as np
+import cv2
 
-def create_frame_grid_state(video_path, frame_indices, grid_size=(1, 2)):
+def create_frame_grid_state(video_path, frame_indices, grid_size=None, hand="hand",
+                            debug=False, show="cropped"):
+    """
+    show:
+      - "cropped": grid 里放裁剪后的图（推荐给 VLM）
+      - "vis":     grid 里放画了 prev_box 的原图（用于你肉眼检查裁剪是否选对手）
+    """
+
+    # ---------- 0) 自动 grid_size ----------
+    n = len(frame_indices)
+    if n == 0:
+        return np.zeros((400, 400, 3), dtype=np.uint8)
+
+    if grid_size is None:
+        # 自动排版：尽量接近平方
+        cols = int(math.ceil(math.sqrt(n)))
+        rows = int(math.ceil(n / cols))
+        grid_size = (rows, cols)
+    else:
+        rows, cols = grid_size
+        if rows * cols < n:
+            # 你传的格子不够就自动扩一下（避免丢帧）
+            cols = max(cols, int(math.ceil(n / rows)))
+            grid_size = (rows, cols)
+
+    rows, cols = grid_size
     spacer = 0
+
+    # ---------- 1) 读帧并裁剪 ----------
     video = cv2.VideoCapture(video_path)
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
     frames = []
 
+    prev_box = None  # 同一个 grid 内保持稳定跟踪
+
     for idx in frame_indices:
-        video.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        success, frame = video.read()
-        if success:
-            # 调整尺寸（保持宽度 400）
-            frame = image_resize(frame, width=400)
-            # 手部检测并裁剪，再缩放回当前尺寸
-            frame = run_groundingdino_and_crop(frame)
-            frames.append(frame)
-        else:
+        video.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        success, frame_bgr = video.read()
+
+        if not success or frame_bgr is None:
             print(f"Warning: Frame {idx} not found (total {total_frames}). Using black frame.")
-            # 使用与前面帧相同尺寸的黑帧
-            black = np.zeros_like(frames[0] if frames else np.zeros((400, 400, 3), dtype=np.uint8))
+            black = np.zeros((400, 400, 3), dtype=np.uint8) if not frames else np.zeros_like(frames[0])
             frames.append(black)
+            continue
+
+        # 统一尺寸（保持 width=400）
+        frame_bgr = image_resize(frame_bgr, width=400)
+
+        # 保留裁剪前的原图（用于 debug 画框）
+        orig = frame_bgr.copy()
+
+        # 裁剪（返回 cropped_img + new_prev_box）
+        cropped, prev_box = run_groundingdino_and_crop_stable(
+            frame_bgr,
+            hand=hand,
+            mirror=False,
+            prev_box=prev_box,
+            expand_ratio=0.25,
+            box_thresh=0.3
+        )
+
+        # 兜底：如果 cropped 失败就回退到原图
+        if cropped is None or not isinstance(cropped, np.ndarray):
+            cropped = orig
+
+        # 给 cropped 打 frame 标记（你想看的“在哪里看出来”最直接就是这里）
+        cv2.putText(
+            cropped, f"{hand} frame={idx}", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2
+        )
+
+        # debug 可视化：在原图上画 prev_box
+        if debug and prev_box is not None:
+            vis = orig.copy()
+            x0, y0, x1, y1 = map(int, prev_box)
+            cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 0), 2)
+            cv2.putText(
+                vis, f"{hand} box @ frame={idx}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2
+            )
+            frames.append(vis if show == "vis" else cropped)
+        else:
+            frames.append(cropped)
+
     video.release()
 
-    # 如果帧不足，填充黑帧
-    total_needed = grid_size[0] * grid_size[1]
+    # ---------- 2) 填充黑帧到 rows*cols ----------
+    total_needed = rows * cols
     if len(frames) < total_needed:
-        missing = total_needed - len(frames)
         black = np.zeros_like(frames[0])
-        frames.extend([black] * missing)
+        frames.extend([black] * (total_needed - len(frames)))
 
+    # ---------- 3) 拼 grid ----------
     fh, fw = frames[0].shape[:2]
-    gh = grid_size[0] * fh + (grid_size[0] - 1) * spacer
-    gw = grid_size[1] * fw + (grid_size[1] - 1) * spacer
+    gh = rows * fh + (rows - 1) * spacer
+    gw = cols * fw + (cols - 1) * spacer
     grid_img = np.ones((gh, gw, 3), dtype=np.uint8) * 255
 
-    for i in range(grid_size[0]):
-        for j in range(grid_size[1]):
-            idx = i * grid_size[1] + j
-            frame = frames[idx]
-            # 渲染圆与数字
-            # cX, cY = fw // 2, fh // 2
-            # max_dim = int(min(fh, fw) * 0.5)
-            # overlay = frame.copy()
-            # if render_pos == 'center':
-            #     center = (cX, cY)
-            # else:
-            #     center = (fw - max_dim//2, max_dim//2)
-            # cv2.circle(overlay, center, max_dim//2, (255,255,255), -1)
-            # frame = cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
-            # cv2.circle(frame, center, max_dim//2, (255,255,255), 2)
-            # # 文本
-            # text = str(idx+1)
-            # ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, max_dim/50, 2)[0]
-            # if render_pos == 'center':
-            #     tx = cX - ts[0]//2
-            #     ty = cY + ts[1]//2
-            # else:
-            #     tx = fw - ts[0]//2 - max_dim//2
-            #     ty = ts[1]//2 + max_dim//2
-            # cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, max_dim/50, (0,0,0), 2)
-
+    for i in range(rows):
+        for j in range(cols):
+            k = i * cols + j
+            frame = frames[k]
+            if frame is None or not isinstance(frame, np.ndarray):
+                frame = np.zeros((fh, fw, 3), dtype=np.uint8)
             y1 = i * (fh + spacer)
             y2 = y1 + fh
             x1 = j * (fw + spacer)
@@ -1058,6 +1722,79 @@ def create_frame_grid_state(video_path, frame_indices, grid_size=(1, 2)):
             grid_img[y1:y2, x1:x2] = frame
 
     return grid_img
+
+import math
+import numpy as np
+import cv2
+
+# def create_frame_grid_state(
+#         video_path,
+#         frame_indices,
+#         grid_size=None,          # ⭐ None 表示自动布局
+#         hand="hand",
+#         max_cols=4,              # ⭐ 每行最多几张
+#         draw_frame_id=True,      # ⭐ 是否在每张小图上写帧号
+# ):
+#     spacer = 6  # 给一点间隔更好看
+#     video = cv2.VideoCapture(video_path)
+#     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+#
+#     frames = []
+#     for idx in frame_indices:
+#         video.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+#         success, frame = video.read()
+#         if success:
+#             frame = image_resize(frame, width=400)
+#             frame = run_groundingdino_and_crop(frame, hand=hand)
+#
+#             # ⭐ 叠加帧号，方便你肉眼确认是不是裁剪/排序对了
+#             if draw_frame_id:
+#                 cv2.putText(
+#                     frame, f"frame={idx}", (10, 30),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA
+#                 )
+#             frames.append(frame)
+#         else:
+#             print(f"Warning: Frame {idx} not found (total {total_frames}). Using black frame.")
+#             black = np.zeros_like(frames[0] if frames else np.zeros((400, 400, 3), dtype=np.uint8))
+#             frames.append(black)
+#
+#     video.release()
+#
+#     n = len(frames)
+#     if n == 0:
+#         return np.zeros((400, 400, 3), dtype=np.uint8)
+#
+#     # ⭐ 自动决定 grid 行列
+#     if grid_size is None:
+#         cols = min(max_cols, n)
+#         rows = int(math.ceil(n / cols))
+#     else:
+#         rows, cols = grid_size
+#
+#     fh, fw = frames[0].shape[:2]
+#     gh = rows * fh + (rows - 1) * spacer
+#     gw = cols * fw + (cols - 1) * spacer
+#     grid_img = np.ones((gh, gw, 3), dtype=np.uint8) * 255
+#
+#     # ⭐ 不足补黑帧
+#     total_needed = rows * cols
+#     if n < total_needed:
+#         black = np.zeros_like(frames[0])
+#         frames.extend([black] * (total_needed - n))
+#
+#     # ⭐ 拼接
+#     k = 0
+#     for r in range(rows):
+#         for c in range(cols):
+#             y1 = r * (fh + spacer)
+#             y2 = y1 + fh
+#             x1 = c * (fw + spacer)
+#             x2 = x1 + fw
+#             grid_img[y1:y2, x1:x2] = frames[k]
+#             k += 1
+#
+#     return grid_img
 
 
 def add_text_with_background(
@@ -1183,6 +1920,103 @@ def _build_mapped_window(center: int, window: int, all_frames_np: np.ndarray, to
     return uniq
 
 # ===== END PATCH: helpers =====
+def build_prompts(hand: str = "right"):
+    # hand ∈ {"left","right","both","any","min","max","avg"} 你也可以只用前三个
+    hand = hand.lower()
+
+    if hand in ["left", "right"]:
+        subj = f"the {hand} hand"
+        # Contact/Separation 都只针对这一只手
+        contact_def = f"Contact means {subj} is in physical contact with the object."
+        sep_def = f"Separation means {subj} is NOT in physical contact with the object."
+        contact_event = f'Left is Separation and Right is Contact w.r.t {subj}'
+        sep_event = f'Left is Contact and Right is Separation w.r.t {subj}'
+        who_contact = f"ONLY judge the interaction between {subj} and the object. Ignore the other hand even if it touches."
+        sep_rule = f"If the {hand} hand is not touching, it is Separation even if the other hand is touching."
+
+    else:
+        # 双手/任意手模式：Contact=任意手接触；Separation=两手都不接触（更合理的“动作结束”定义）
+        subj = "either hand"
+        contact_def = "Contact means at least ONE hand is in physical contact with the object."
+        sep_def = "Separation means NO hands are in contact with the object (both hands are separate)."
+        contact_event = "Left is Separation (no hands touching) and Right is Contact (at least one hand touching)"
+        sep_event = "Left is Contact (at least one hand touching) and Right is Separation (no hands touching)"
+        who_contact = "Judge using BOTH hands."
+        sep_rule = "If at least one hand is still touching, it is NOT separation."
+
+    prompt_contact = f"""
+Instruction:
+You will be given a time-ordered image grid containing hands and a target object.
+Your task is to find the earliest contact moment, and return its grid index.
+
+Focus:
+- {who_contact}
+- {contact_def}
+
+Rules:
+- If contact is already visible in all frames, return the earliest frame (usually the first).
+- If no contact is detected within the grid, return -1.
+
+Strict Output Format:
+"Frame: X"  (X is the grid cell index, starting from 1)
+or
+"Frame: -1"
+""".strip()
+
+    prompt_separation = f"""
+Instruction:
+You will be given a time-ordered image grid containing hands and a target object.
+Your task is to find the earliest separation moment, and return its grid index.
+
+Focus:
+- {who_contact}
+- {sep_def}
+
+Rules:
+- {sep_rule}
+- If no separation is detected within the grid, return -1.
+
+Strict Output Format:
+"Frame: X"  (X is the grid cell index, starting from 1)
+or
+"Frame: -1"
+""".strip()
+
+    prompt_state = f"""
+Instruction:
+
+You are given a time-ordered image grid (earlier→later). 
+Determine whether there is a transition to Contact or to Separation within the grid, and output Event.
+Definitions (per frame):
+- {contact_def}
+- {sep_def}
+
+Event Logic (Left -> Right):
+- If {contact_event} -> "Event: Contact"
+- If {sep_event} -> "Event: Separation"
+- Otherwise -> "Event: Neither"
+
+Strict Output Format:
+Output exactly one line:
+"Event: Contact" OR "Event: Separation" OR "Event: Neither"
+""".strip()
+
+    feedback_prompt_contact = f"""
+You will be given ONE image with hands and an object.
+Decide whether it is CONTACT under this rule:
+- {contact_def}
+Answer 1 if yes, else 0. Output only 1 or 0.
+""".strip()
+
+    feedback_prompt_separation = f"""
+You will be given ONE image with hands and an object.
+Decide whether it is SEPARATION under this rule:
+- {sep_def}
+{sep_rule}
+Answer 1 if yes, else 0. Output only 1 or 0.
+""".strip()
+
+    return prompt_contact, prompt_separation, prompt_state, feedback_prompt_contact, feedback_prompt_separation
 
 
 def process_task(
@@ -1195,46 +2029,49 @@ def process_task(
         max_feedback=5,
         video_type="short",
         keyframe_sampling_mode="adaptive",
-        use_feedback=False
+        use_feedback=False,
+        hand="right",      # ⭐ 新增
 ):
     """Process a task to identify the start or end of an action in a video."""
-    prompt_contact = (
-        """
-        Instruction:
-        You will be given a time-ordered image grid containing a hand and a target object. Your task is to find the earliest contact moment, where the hand first contacts with the object, and return its index.
-
-        Reasoning Steps:
-        1. Analyze each frame to observe the relationship between the hand and the object.
-        2. Identify the earliest transition from separation (hand not touching the object) → contact (hand touching the object).
-        3. If no contact is detected within the grid, return -1.
-
-        Strict Output Format:
-        If a contact moment is detected:
-        "Frame: X"  
-        (Where X is the index of the earliest contact frame)
-        If no contact is detected:
-        "Frame: -1"
-        """
-    )
-
-    prompt_separation = (
-        """
-        Instruction:
-        You will be given a time-ordered image grid containing a hand and a target object. Your task is to find the earliest separation moment, where the hand first separates with the object, and return its index.
-
-        Reasoning Steps:
-        1. Analyze each frame to observe the relationship between the hand and the object.
-        2. Identify the earliest transition from contact (hand touching the object) → separation (hand moving away from the object).
-        3. If no separation is detected within the grid, return -1.
-
-        Strict Output Format:
-        If a separation moment is detected:
-        "Frame: X"  
-        (Where X is the index of the earliest separation frame)
-        If no separation is detected:
-        "Frame: -1"
-        """
-    )
+    #起始
+    # prompt_contact = (
+    #     """
+    #     Instruction:
+    #     You will be given a time-ordered image grid containing a hand and a target object. Your task is to find the earliest contact moment, where the hand first contacts with the object, and return its index.
+    #
+    #     Reasoning Steps:
+    #     1. Analyze each frame to observe the relationship between the hand and the object.
+    #     2. Identify the earliest transition from separation (hand not touching the object) → contact (hand touching the object).
+    #     3. If no contact is detected within the grid, return -1.
+    #
+    #     Strict Output Format:
+    #     If a contact moment is detected:
+    #     "Frame: X"
+    #     (Where X is the index of the earliest contact frame)
+    #     If no contact is detected:
+    #     "Frame: -1"
+    #     """
+    # )
+    #
+    # prompt_separation = (
+    #     """
+    #     Instruction:
+    #     You will be given a time-ordered image grid containing a hand and a target object. Your task is to find the earliest separation moment, where the hand first separates with the object, and return its index.
+    #
+    #     Reasoning Steps:
+    #     1. Analyze each frame to observe the relationship between the hand and the object.
+    #     2. Identify the earliest transition from contact (hand touching the object) → separation (hand moving away from the object).
+    #     3. If no separation is detected within the grid, return -1.
+    #
+    #     Strict Output Format:
+    #     If a separation moment is detected:
+    #     "Frame: X"
+    #     (Where X is the index of the earliest separation frame)
+    #     If no separation is detected:
+    #     "Frame: -1"
+    #     """
+    # )
+    # 终止
     # prompt_state = (
     #     """
     #     Instruction:
@@ -1265,36 +2102,38 @@ def process_task(
     #     """
     # )
 
-    prompt_state = (
-        """
-        Instruction:
-        - You are given two image frames: a previous frame (Frame Left) and a future frame (Frame Right).
-        - Your task is to detect a **Contact Moment** or **Separation Moment** by analyzing the change in interaction between the hand and a target object of the two frames.
-        - Avoid outputting "Event: Neither" unless both frames clearly and confidently show the **same state with no visible change**.
-
-        Definitions:
-        - Contact: The hand is visibly touching or making physical contact with the object (e.g., fingers pressed against the surface, grasping).
-        - Separation: The hand is clearly not in contact with the object (e.g., fingers hovering, obvious gap, no overlap).
-
-        Steps:
-        1. Ensure the same target object is being observed in both frames.
-        2. For each frame:
-        - Check whether the hand is **clearly touching** or **clearly not touching** the object.
-        - If it’s ambiguous, lean toward detecting **Contact** if the hand is near or aligned for grasp; lean toward **Separation** if the hand is retreating or open.
-        3. Decide the event based on the transition:
-        - If Frame Left = Separation and Frame Right = Contact → output: **Event: Contact**
-        - If Frame Left = Contact and Frame Right = Separation → output: **Event: Separation**
-        - If both frames show **no significant change**, and you are confident the contact state stayed the same → output: **Event: Neither**
-        - In cases of uncertainty or partial motion, prefer to output **Contact** or **Separation** over “Neither”.
-
-        Output Format (Strict):
-        Output exactly one of the following as the final line:
-        - "Event: Contact"
-        - "Event: Separation"
-        - "Event: Neither"
-
-        """
-    )
+    #起始
+    # prompt_state = (
+    #     """
+    #     Instruction:
+    #     - You are given two image frames: a previous frame (Frame Left) and a future frame (Frame Right).
+    #     - Your task is to detect a **Contact Moment** or **Separation Moment** by analyzing the change in interaction between the hand and a target object of the two frames.
+    #     - Avoid outputting "Event: Neither" unless both frames clearly and confidently show the **same state with no visible change**.
+    #
+    #     Definitions:
+    #     - Contact: The hand is visibly touching or making physical contact with the object (e.g., fingers pressed against the surface, grasping).
+    #     - Separation: The hand is clearly not in contact with the object (e.g., fingers hovering, obvious gap, no overlap).
+    #
+    #     Steps:
+    #     1. Ensure the same target object is being observed in both frames.
+    #     2. For each frame:
+    #     - Check whether the hand is **clearly touching** or **clearly not touching** the object.
+    #     - If it’s ambiguous, lean toward detecting **Contact** if the hand is near or aligned for grasp; lean toward **Separation** if the hand is retreating or open.
+    #     3. Decide the event based on the transition:
+    #     - If Frame Left = Separation and Frame Right = Contact → output: **Event: Contact**
+    #     - If Frame Left = Contact and Frame Right = Separation → output: **Event: Separation**
+    #     - If both frames show **no significant change**, and you are confident the contact state stayed the same → output: **Event: Neither**
+    #     - In cases of uncertainty or partial motion, prefer to output **Contact** or **Separation** over “Neither”.
+    #
+    #     Output Format (Strict):
+    #     Output exactly one of the following as the final line:
+    #     - "Event: Contact"
+    #     - "Event: Separation"
+    #     - "Event: Neither"
+    #
+    #     """
+    # )
+    #终止
 
     # prompt_state = (
     #     """
@@ -1324,6 +2163,7 @@ def process_task(
     #     - "Event: Separation"
     #     """
     # )
+    prompt_contact, prompt_separation, prompt_state, fb_contact, fb_separation = build_prompts(hand)
 
     # Iterate to narrow down the time
     video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -1334,16 +2174,35 @@ def process_task(
     json_path = get_json_path(video_name)
     json_folder_path = get_json_folder_path(video_name)
     # 读取全部帧和速度
-    with open(json_path, 'r') as f:
-        all_data = json.load(f)
-    all_frames = np.array([x[0] for x in all_data])
-    all_speeds = np.array([x[1] for x in all_data])
+    # with open(json_path, 'r') as f:
+    #     all_data = json.load(f)
+    # all_frames = np.array([x[0] for x in all_data])
+    # all_speeds = np.array([x[1] for x in all_data])
+    #  当前 hand 的单手速度
+    scalar_data = _load_speed_scalar(str(json_path), hand=hand)
+    if not scalar_data:
+        print(f"[process_task] {video_name}, hand={hand} 没有有效速度数据")
+        return []
+
+    all_frames = np.array([x[0] for x in scalar_data])
+    all_speeds = np.array([x[1] for x in scalar_data])
     # 根据video_type选择极小值点提取函数
+    # if video_type == "short":
+    #     minima_indices = extract_local_minima_frames(video_name, json_folder_path)
+    #     minima_speeds = [all_speeds[np.where(all_frames == idx)[0][0]] for idx in minima_indices]
+    # else:
+    #     minima_indices, minima_speeds = extract_local_minima_frames_adaptive(video_name, json_folder_path)
     if video_type == "short":
-        minima_indices = extract_local_minima_frames(video_name, json_folder_path)
-        minima_speeds = [all_speeds[np.where(all_frames == idx)[0][0]] for idx in minima_indices]
+        minima_indices = extract_local_minima_frames(video_name, json_folder_path, hand=hand)
+        minima_speeds = [
+            all_speeds[np.where(all_frames == idx)[0][0]]
+            for idx in minima_indices if np.any(all_frames == idx)
+        ]
     else:
-        minima_indices, minima_speeds = extract_local_minima_frames_adaptive(video_name, json_folder_path)
+        minima_indices, minima_speeds = extract_local_minima_frames_adaptive(
+            video_name, json_folder_path, hand=hand
+        )
+
     print(f"{video_name}获取的极小值列表为:{minima_indices}")
     selected_frame_index = []
     while minima_indices:
@@ -1353,7 +2212,7 @@ def process_task(
         minima_indices.pop(idx)
         minima_speeds.pop(idx)
         # 采样关键帧索引
-        window = 2
+        window =8
         minima_idx = selected_minima
         #candidate_indices = [i for i in range(minima_idx - window, minima_idx + window + 1) if 0 <= i < total_frames]
         # 候选集合（就近映射到实际存在的 all_frames）
@@ -1383,13 +2242,23 @@ def process_task(
         else:
             keyframe_index = np.random.choice(candidate_indices)
         state_frame_indices, minima_index = select_frames_near_average(keyframe_index, 3, total_frames, [])
-        state_indices = [state_frame_indices[0], state_frame_indices[-1]]
+        # state_indices = [state_frame_indices[0], state_frame_indices[-1]]
+        state_indices = list(state_frame_indices)  # 全部帧
+        # center = int(keyframe_index)
+        # state_indices = _build_mapped_window(center=center, window=2, all_frames_np=all_frames,
+        #                                      total_frames=total_frames)
+        # state_indices 长度通常是 5（去重后可能少一点）
+
         print(f"选取的判断帧为{state_frame_indices[0]}和{state_frame_indices[-1]}")
         image_state = create_frame_grid_state(
-            video_path, state_indices)
+            video_path, state_indices,hand=hand)
         image_RGB = cv2.cvtColor(image_state, cv2.COLOR_BGR2RGB)
         grid_image = Image.fromarray(image_RGB)
-        # grid_image.save(f"/home/grid_EgoLoc.png")
+        left_idx, right_idx = state_frame_indices[0],state_frame_indices[-1]
+        if hand=="right":
+            grid_image.save(f"/home/EgoLoc/grid/right2/{video_name}_L{left_idx}_R{right_idx}.png")
+        if hand=="left":
+            grid_image.save(f"/home/EgoLoc/grid/left2/{video_name}_L{left_idx}_R{right_idx}.png")
         grid_image.save(debug_dir / f"{video_name}_state.png")
         state = scene_understanding(
             credentials, image_state, prompt_state, principle="state")
@@ -1423,16 +2292,19 @@ def process_task(
                         while feedback_count < max_feedback:
                             tried_frames.add(final_frame)
                             single_image = create_frame_grid_with_keyframe(video_path, [final_frame], 1)
-                            if state == "Contact":
-                                feedback_prompt = (
-                                    "I will show an image of hand-object interaction. "
-                                    "You need to help me determine whether the hand and the object in the current image are in contact rather than just appearing to be in contact. "
-                                    "If yes, answer 1. If not, answer 0.")
-                            else:
-                                feedback_prompt = (
-                                    "I will show an image of hand-object interaction. "
-                                    "You need to help me determine whether the hand and the object in the current image are in seperate rather than just appearing to be in seperate. "
-                                    "If yes, answer 1. If not, answer 0.")
+                            # if state == "Contact":
+                            #     feedback_prompt = (
+                            #         "I will show an image of hand-object interaction. "
+                            #         "You need to help me determine whether the hand and the object in the current image are in contact rather than just appearing to be in contact. "
+                            #         "If yes, answer 1. If not, answer 0.")
+                            # else:
+                            #     feedback_prompt = (
+                            #         "I will show an image of hand-object interaction. "
+                            #         "You need to help me determine whether the hand and the object in the current image are in seperate rather than just appearing to be in seperate. "
+                            #         "If yes, answer 1. If not, answer 0.")
+                            feedback_prompt = fb_contact if state == "Contact" else fb_separation
+                            feedback_result = scene_understanding(credentials, single_image, feedback_prompt, flag)
+
                             feedback_result = scene_understanding(credentials, single_image, feedback_prompt, flag)
                             print(f"反馈VLM输出: {feedback_result}")
                             if is_positive_feedback(feedback_result):
@@ -1498,7 +2370,7 @@ def calculate_max_mode_average(list_of_pairs_lists):
     return averaged_pairs
 
 
-def convert_video(video_file_path: str, action: str, credentials, grid_size: int, video_type="short", max_feedback=1):
+def convert_video(video_file_path: str, action: str, credentials, grid_size: int, video_type="short", max_feedback=1,hand="right"):
     video = cv2.VideoCapture(video_file_path)
     fps = video.get(cv2.CAP_PROP_FPS)
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1508,12 +2380,17 @@ def convert_video(video_file_path: str, action: str, credentials, grid_size: int
         grid_size,
         total_frames,
         max_feedback=max_feedback,
-        video_type=video_type)
+        video_type=video_type,
+        hand=hand,
+    )
     # print(results)
     video_name = os.path.splitext(os.path.basename(video_file_path))[0]
     json_path = get_json_path(video_name)
-    with open(json_path, 'r') as f:
-        speed_data = json.load(f)
+    # with open(json_path, 'r') as f:
+    #     speed_data = json.load(f)
+    # pair = get_contact_separation_pairs(results, speed_data)
+    # 再次按 hand 取 (frame, speed)，给 get_contact_separation_pairs 用
+    speed_data = _load_speed_scalar(str(json_path), hand=hand)
     pair = get_contact_separation_pairs(results, speed_data)
     return pair
 
@@ -1535,7 +2412,7 @@ if not all(key in credentials for key in required_keys):
     raise ValueError("Required keys are missing in the credentials file")
 render_pos = 'topright'  # center or topright
 grid_size = int(pargs.grid)
-video_folder = "/home/EgoLoc/hand_data_drawer/right_videos"
+video_folder = "/home/EgoLoc/hand_data_drawer/twohands_test1"
 action = pargs.action
 video_type = pargs.video_type
 folder_name = action.replace(" ", "_")
@@ -1544,59 +2421,119 @@ output_folder = f"results/{folder_name}"
 if __name__ == "__main__":
     # 获取文件夹中的所有 MP4 文件并按顺序排序
     video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
-    save_path = "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"
-    speed_output_root = "/home/EgoLoc/hand_data_drawer/3D_hand_right"
+    # save_path = "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"
+    speed_output_root = "/home/EgoLoc/hand_data_drawer/twohands_test_out15"
     # save_path = "/home/VLM-Video-Action-Localization-main/VLM-Video-Action-Localization-main/result/greedyVLM_drawer_grid5.json"
     # 排序视频文件，基于文件名中 'c' 后的数字部分
     sorted_video_files = sorted(video_files, key=lambda x: int(x.split('.')[0][5:]))
-    all_predictions = load_predictions(save_path)
+    # all_predictions = load_predictions(save_path)
     #batch_process_videos(video_folder, speed_output_root, device="cuda", encoder="vits")  # 后续添加对已有文件的跳过
-    processed_video_files = {prediction[0] for prediction in all_predictions}
+    # processed_video_files = {prediction[0] for prediction in all_predictions}
+    #
+    # # 按顺序遍历视频文件
+    # for video_file in sorted_video_files:
+    #     if video_file in processed_video_files:
+    #         continue
+    #     video_path = os.path.join(video_folder, video_file)
+    #     # video_path = "/home/bathroomCabinet/video_cleaned/video32.mp4"
+    #     if os.path.exists(video_path):
+    #         list_of_pair = []
+    #         for i in range(1):
+    #             pair = convert_video(
+    #                 video_path, action, credentials, grid_size, video_type=video_type, max_feedback=1)
+    #             list_of_pair.append(pair)
+    #
+    #         averaged_pairs = calculate_max_mode_average(list_of_pair)
+    #
+    #         if len(averaged_pairs) == 0:
+    #             print(f"{video_file} can't predict")
+    #             all_predictions.append([video_file, [(0, 0)]])
+    #         else:
+    #             print(f"{video_file} pairs: {averaged_pairs}")
+    #             all_predictions.append([video_file, averaged_pairs])
+    #
+    #         save_predictions(all_predictions, save_path)
+    #
+    # if video_type == "short":
+    #     result = evaluate_predictions(
+    #         json_path=save_path,
+    #         gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
+    #         sheet_name="Sheet9"  # 你也可以换其他sheet
+    #     )
+    #     print(result)
+    #
+    # elif video_type == "long":
+    #     results = evaluate_all(
+    #         pred_json=save_path,
+    #         gt_xlsx="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
+    #         sheet_name="hand_data_cabinet",
+    #         sr_tolerances=(1, 3, 5),
+    #         psr_tolerance=10
+    #     )
+    #     print("Evaluation Results:")
+    #     for k, v in results.items():
+    #         print(f"{k}: {v:.4f}")
+    for hand in ["left", "right"]:
+        print(f"\n====== 处理 {hand} 手 ======\n")
 
-    # 按顺序遍历视频文件
-    for video_file in sorted_video_files:
-        if video_file in processed_video_files:
-            continue
-        video_path = os.path.join(video_folder, video_file)
-        # video_path = "/home/bathroomCabinet/video_cleaned/video32.mp4"
-        if os.path.exists(video_path):
+        # 每只手一份结果文件
+        if hand == "right":
+            save_path = "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"
+        else:
+            save_path = "/home/EgoLoc/ManiTIL_prompt/left_grid4.json"
+
+        all_predictions = load_predictions(save_path)
+        processed_video_files = {prediction[0] for prediction in all_predictions}
+
+        for video_file in sorted_video_files:
+            if video_file in processed_video_files:
+                continue
+
+            video_path = os.path.join(video_folder, video_file)
+            if not os.path.exists(video_path):
+                continue
+
             list_of_pair = []
             for i in range(1):
                 pair = convert_video(
-                    video_path, action, credentials, grid_size, video_type=video_type, max_feedback=1)
+                    video_path,
+                    action,
+                    credentials,
+                    grid_size,
+                    video_type=video_type,
+                    max_feedback=1,
+                    hand=hand,  # ⭐ 关键：这一轮是 hand
+                )
                 list_of_pair.append(pair)
 
             averaged_pairs = calculate_max_mode_average(list_of_pair)
 
             if len(averaged_pairs) == 0:
-                print(f"{video_file} can't predict")
+                print(f"{video_file} ({hand}) can't predict")
                 all_predictions.append([video_file, [(0, 0)]])
             else:
-                print(f"{video_file} pairs: {averaged_pairs}")
+                print(f"{video_file} ({hand}) pairs: {averaged_pairs}")
                 all_predictions.append([video_file, averaged_pairs])
 
             save_predictions(all_predictions, save_path)
 
-    if video_type == "short":
-        result = evaluate_predictions(
-            json_path=save_path,
-            gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
-            sheet_name="Sheet9"  # 你也可以换其他sheet
-        )
-        print(result)
-
-    elif video_type == "long":
-        results = evaluate_all(
-            pred_json=save_path,
-            gt_xlsx="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
-            sheet_name="hand_data_cabinet",
-            sr_tolerances=(1, 3, 5),
-            psr_tolerance=10
-        )
-        print("Evaluation Results:")
-        for k, v in results.items():
-            print(f"{k}: {v:.4f}")
-
-
-
-
+        # # 每只手各自评估一次
+        # if video_type == "short":
+        #     result = evaluate_predictions(
+        #         json_path=save_path,
+        #         gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
+        #         sheet_name="Sheet9"
+        #     )
+        #     print(f"\nEvaluation ({hand}):", result)
+        #
+        # elif video_type == "long":
+        #     results_eval = evaluate_all(
+        #         pred_json=save_path,
+        #         gt_xlsx="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
+        #         sheet_name="hand_data_cabinet",
+        #         sr_tolerances=(1, 3, 5),
+        #         psr_tolerance=10
+        #     )
+        #     print(f"\nEvaluation ({hand}):")
+        #     for k, v in results_eval.items():
+        #         print(f"{k}: {v:.4f}")

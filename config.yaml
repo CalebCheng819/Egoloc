@@ -1,0 +1,71 @@
+# config.yaml
+experiment:
+  seed: 42
+  run_name: "drawer_grid4"
+  save_config_dir: "./runs"    # 每次运行把解析后的配置保存到这里（带时间戳）
+
+io:
+  video_folder: "/home/EgoLoc/hand_data_drawer/right_videos"
+  speed_output_root: "/home/EgoLoc/hand_data_drawer/3D_hand_right"
+  results_json: "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"
+  gt_excel_path: "/home/EgoLoc/ground_truth/KitchenCounter1.xlsx"
+  debug_root: "/home/EgoLoc/hand_data_drawer/debug_grids"
+
+openai:
+  use_azure: true
+  azure_deployment_name: "${AZURE_OPENAI_DEPLOYMENT_NAME}" # 也可直接写固定名
+  api_version: "2024-02-01"
+  endpoint_env: "${AZURE_OPENAI_ENDPOINT}"
+  key_env: "${AZURE_OPENAI_API_KEY}"
+  fallback_openai_key_env: "${OPENAI_API_KEY}"
+  base_url_if_openai: "https://api.chatanywhere.tech/v1"
+  max_retries: 5
+  retry_sleep_rate_limit_sec: 5
+  retry_sleep_status_sec: 1
+  chat:
+    model_if_openai: "gpt-4o"
+    max_tokens: 200
+    temperature: 0.1
+    top_p: 0.5
+    frequency_penalty: 0.0
+    presence_penalty: 0.0
+
+video:
+  grid_size: 4
+  video_type: "short"   # short / long
+  render_pos: "topright" # center / topright
+  keyframe_sampling_mode: "adaptive"  # adaptive / random
+  use_feedback: false
+  max_feedback: 1
+
+prompts:
+  text_prompt_for_crop: "hand"
+  box_thresh: 0.35
+  text_thresh: 0.25
+  crop_expand_px: 10
+
+minima_extraction:
+  impl: "adaptive"  # "classic" / "adaptive"
+  classic:
+    folder_path: "/home/bathroomCabinet/3D_hand_speed"
+    thresh: 1.0
+    savgol_polyorder: 2
+    savgol_mode: "nearest"
+    spline_s: 1e-4
+  adaptive:
+    folder_path: "/home/EgoLoc/hand_data_drawer/3D_hand_speed_hamer"
+    min_peak_distance_ratio: 0.03  # 相对有效点数
+    smooth_points: 300              # 插值点数下限
+
+evaluation:
+  sheet_name_short: "Sheet9"
+  sheet_name_long: "hand_data_cabinet"
+  sr_tolerances: [1, 3, 5]
+  psr_tolerance: 10
+
+paths_for_json_helpers:
+  base_dir_for_json: "/home/EgoLoc/hand_data_drawer/3D_hand_right"  # get_json_path/get_json_folder_path 用
+
+runtime:
+  print_config: true
+  save_config_snapshot: true
