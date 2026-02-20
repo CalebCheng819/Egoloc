@@ -118,10 +118,10 @@ def _need(hooks: Hooks, name: str):
 # ---------------------------------------------------------------------------
 # HaMeR / ViTPose – created once, reused
 # ---------------------------------------------------------------------------
-_HAMER_CACHE: Dict[str, ViTPoseModel] = {}
+_HAMER_CACHE: Dict[str, Any] = {}
 
 def _get_vitpose_model(device: str = "cuda") -> ViTPoseModel:
-    """Return a cached ViTPoseModel (no Detectron2 dependency)."""
+    """Return a cached ViTPoseModel."""
     if "cpm" in _HAMER_CACHE:
         return _HAMER_CACHE["cpm"]
 
@@ -142,6 +142,70 @@ def _get_vitpose_model(device: str = "cuda") -> ViTPoseModel:
 
     _HAMER_CACHE["cpm"] = ViTPoseModel(device)
     return _HAMER_CACHE["cpm"]
+
+
+def _get_body_detector(device: str = "cuda"):
+    """Return a cached Detectron2 body detector (HaMeR style)."""
+    if "detector" in _HAMER_CACHE:
+        return _HAMER_CACHE["detector"]
+    
+    try:
+        # 确保 hamer 包在 sys.path 中
+        import sys
+        import importlib.util
+        
+        # 尝试多种方式导入
+        try:
+            # 方式1: 标准导入（如果 hamer 已安装）
+            from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
+        except ImportError:
+            # 方式2: 直接导入文件
+            utils_detectron2_path = Path(HAMER_ROOT) / "hamer" / "utils" / "utils_detectron2.py"
+            if utils_detectron2_path.exists():
+                spec = importlib.util.spec_from_file_location("hamer.utils.utils_detectron2", utils_detectron2_path)
+                utils_detectron2_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(utils_detectron2_module)
+                DefaultPredictor_Lazy = utils_detectron2_module.DefaultPredictor_Lazy
+            else:
+                raise ImportError(f"Cannot find utils_detectron2.py at {utils_detectron2_path}")
+        
+        from detectron2.config import LazyConfig
+        import hamer
+        
+        # 使用 regnety 检测器（更快，内存占用更少）
+        try:
+            from detectron2 import model_zoo
+            from detectron2.config import get_cfg
+            detectron2_cfg = model_zoo.get_config(
+                'new_baselines/mask_rcnn_regnety_4gf_dds_FPN_400ep_LSJ.py', 
+                trained=True
+            )
+            detectron2_cfg.model.roi_heads.box_predictor.test_score_thresh = 0.5
+            detectron2_cfg.model.roi_heads.box_predictor.test_nms_thresh = 0.4
+            detector = DefaultPredictor_Lazy(detectron2_cfg)
+            log.info("[DET] Using RegNetY detector (faster)")
+        except Exception as e:
+            # 回退到 vitdet
+            log.info("[DET] RegNetY not available, using ViTDet")
+            cfg_path = Path(hamer.__file__).parent / 'configs' / 'cascade_mask_rcnn_vitdet_h_75ep.py'
+            detectron2_cfg = LazyConfig.load(str(cfg_path))
+            # 尝试使用本地模型路径
+            local_model = "/home/hamer/models/model_final_f05665.pkl"
+            if os.path.exists(local_model):
+                detectron2_cfg.train.init_checkpoint = local_model
+            else:
+                detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
+            
+            for i in range(3):
+                detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
+            detector = DefaultPredictor_Lazy(detectron2_cfg)
+        
+        _HAMER_CACHE["detector"] = detector
+        return detector
+    except Exception as e:
+        log.warning(f"[DET] Failed to load Detectron2 detector: {e}")
+        log.warning("[DET] Falling back to depth-guided method")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +255,9 @@ def _invalid_depth_indices(depth_dir: Path) -> List[int]:
     bad_idx = []
     for f in depth_dir.glob("pred_depth_*.npy"):
         idx = int(f.stem.split("_")[-1])
-        inv = np.load(f, mmap_mode="r")
-        if _is_invalid_inv(inv):
+        depth = np.load(f, mmap_mode="r")
+        # 使用 metric depth 检查函数
+        if _is_invalid_depth(depth):
             bad_idx.append(idx)
     return bad_idx
 
@@ -209,19 +274,17 @@ def _remove_depth_tensors(depth_dir: Path, indices: List[int]) -> None:
 # ---------------------------------------------------------------------------
 def _load_depth(depth_dir: Path, idx: int) -> Optional[np.ndarray]:
     """
-    VDA stores **inverse depth** (bigger = nearer).
-    Convert to metric depth in metres and keep a useful range.
+    加载 metric depth（单位：米）。
     
-    NOTE: 如果你已经有 metric depth（单位：米），需要修改此函数：
-    直接返回 np.load(f).astype(np.float32)，跳过逆深度转换。
+    NOTE: MoGe2 输出的是 metric depth，直接返回，不做逆深度转换。
+    如果将来需要使用 VDA 的逆深度，需要修改此函数。
     """
     f = depth_dir / f"pred_depth_{idx:06d}.npy"
     if not f.exists():
         return None
-    inv = np.load(f).astype(np.float32)          # (H, W)
-    if _is_invalid_inv(inv):                     # ← early-reject unusable tensor
+    depth = np.load(f).astype(np.float32)        # (H, W) metric depth in metres
+    if _is_invalid_depth(depth):                 # ← early-reject unusable tensor
         return None
-    depth = DEPTH_SCALE_M / (inv + 1e-6)         # invert once, not twice
     return depth
 
 
@@ -239,9 +302,68 @@ def _pixel_to_camera(u: float, v: float, z: float, W: int, H: int):
 # ---------------------------------------------------------------------------
 # Wrist detection helper (depth‑guided + ViTPose)
 # ---------------------------------------------------------------------------
-def _wrist_from_frame(frame_bgr: np.ndarray, gray_depth: np.ndarray, cpm: ViTPoseModel):
+def _wrist_from_frame(frame_bgr: np.ndarray, gray_depth: np.ndarray, cpm: ViTPoseModel, detector=None):
+    """
+    HaMeR 风格的手腕检测：
+    1. 使用 Detectron2 检测人体
+    2. 在全图使用 ViTPose 检测人体关键点
+    3. 从人体关键点中提取手部关键点
+    4. 返回手腕位置
+    """
+    # 如果没有提供检测器，尝试获取
+    if detector is None:
+        detector = _get_body_detector()
+    
+    # 如果检测器不可用，回退到深度引导方法
+    if detector is None:
+        return _wrist_from_frame_depth_guided(frame_bgr, gray_depth, cpm)
+    
+    try:
+        # 1) 使用 Detectron2 检测人体
+        det_out = detector(frame_bgr)
+        det_instances = det_out['instances']
+        valid_idx = (det_instances.pred_classes == 0) & (det_instances.scores > 0.5)
+        pred_bboxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
+        pred_scores = det_instances.scores[valid_idx].cpu().numpy()
+        
+        if len(pred_bboxes) == 0:
+            return None
+        
+        # 2) 在全图使用 ViTPose 检测人体关键点
+        img_rgb = frame_bgr[:, :, ::-1]  # BGR -> RGB
+        vitposes_out = cpm.predict_pose(
+            img_rgb,
+            [np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1)],
+        )
+        
+        if len(vitposes_out) == 0:
+            return None
+        
+        # 3) 从人体关键点中提取手部关键点（使用第一个检测到的人）
+        vitposes = vitposes_out[0]
+        right_hand_keyp = vitposes['keypoints'][-21:]  # 右手21个关键点
+        
+        # 4) 检查手部关键点置信度
+        valid = right_hand_keyp[:, 2] > 0.5  # 置信度阈值 0.5（HaMeR 使用 0.5）
+        if valid.sum() <= 3:
+            return None
+        
+        # 5) 返回手腕位置（第0个关键点）
+        wrist_u = float(right_hand_keyp[0, 0])
+        wrist_v = float(right_hand_keyp[0, 1])
+        return wrist_u, wrist_v
+        
+    except Exception as e:
+        log.warning(f"[WRIST] HaMeR detection failed: {e}, falling back to depth-guided")
+        return _wrist_from_frame_depth_guided(frame_bgr, gray_depth, cpm)
+
+
+def _wrist_from_frame_depth_guided(frame_bgr: np.ndarray, gray_depth: np.ndarray, cpm: ViTPoseModel):
+    """
+    原始的深度引导方法（作为回退方案）
+    """
     # 1) Depth‑based hand ROI – nearest object in view
-    nearest = gray_depth < np.percentile(gray_depth, 15)  # closest 25 %,原来是10
+    nearest = gray_depth < np.percentile(gray_depth, 15)  # closest 15%
     labels, n_lbl = ndimage.label(nearest)
     if n_lbl == 0:
         return None
@@ -263,14 +385,13 @@ def _wrist_from_frame(frame_bgr: np.ndarray, gray_depth: np.ndarray, cpm: ViTPos
     pose = cpm.predict_pose(roi_bgr[:, :, ::-1], [bbox])[0]
 
     hand_kpts = pose["keypoints"][-21:]  # right‑hand keypoints
-    valid = hand_kpts[:, 2] > 0.3#原来是0.35
+    valid = hand_kpts[:, 2] > 0.3
     if valid.sum() <= 3:
         return None
 
     wrist_u = x0 + hand_kpts[0, 0]
     wrist_v = y0 + hand_kpts[0, 1]
     return float(wrist_u), float(wrist_v)
-
 
 # ---------------------------------------------------------------------------
 # Point Cloud Generation
@@ -440,8 +561,24 @@ def _unpack_depth_npz(depth_dir: Path) -> None:
 def _is_invalid_inv(inv: np.ndarray) -> bool:
     """
     Return True when the inverse-depth tensor is all-NaN/Inf or nearly flat.
+    NOTE: 现在用于 metric depth，检查逻辑仍然适用（NaN/Inf/平坦检查）。
     """
     return (not np.isfinite(inv).any()) or np.nanstd(inv) < 1e-4
+
+def _is_invalid_depth(depth: np.ndarray) -> bool:
+    """
+    Return True when the metric depth tensor is all-NaN/Inf or nearly flat.
+    用于检查 metric depth（单位：米）的有效性。
+    """
+    if not np.isfinite(depth).any():
+        return True
+    # 对于 metric depth，检查标准差是否太小（几乎平坦）
+    # 也检查是否有合理的深度范围（例如 0.01m 到 10m）
+    valid_mask = np.isfinite(depth) & (depth > 0.01) & (depth < 10.0)
+    if valid_mask.sum() == 0:
+        return True
+    std_val = np.nanstd(depth[valid_mask])
+    return std_val < 1e-4
 
 # def extract_3d_speed_and_visualize(
 #     video_path: str,
@@ -674,7 +811,7 @@ def robust_depth_at(
         print(f"  median z = {z:.3f}")
 
     return z
-def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: str = "cuda", encoder: str = "vits") -> Tuple[List[List[float]], str, str, str]:
+def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: str = "cuda", encoder: str = "vits", depth_root: Optional[str] = None, speed_only: bool = False, intermediate_dir: Optional[str] = None) -> Tuple[List[List[float]], str, str, str]:
     """
     返回：
       - speed_pairs: [[frame, speed], ...]
@@ -687,33 +824,55 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
     video_name = Path(video_path).stem
     prev_z = None  # 上一帧左手的深度（米）
 
-    depth_dir = output_dir / "depth"
+    # 确定深度文件目录和中间文件目录
+    # 如果指定了 intermediate_dir，使用它；否则根据 speed_only 决定
+    if intermediate_dir is not None:
+        intermediate_dir = Path(intermediate_dir)
+    elif speed_only and depth_root is not None:
+        intermediate_dir = Path(depth_root) / video_name
+    else:
+        intermediate_dir = output_dir
+    
+    # 确定深度文件目录：优先使用预转换的深度，否则使用输出目录
+    if depth_root is not None:
+        # 使用预转换的深度目录
+        pre_depth_dir = Path(depth_root) / video_name / "depth"
+        if pre_depth_dir.exists() and list(pre_depth_dir.glob("pred_depth_*.npy")):
+            depth_dir = pre_depth_dir
+            log.info("[3D] Using pre-converted depth from: %s", depth_dir)
+        else:
+            depth_dir = intermediate_dir / "depth"
+            log.info("[3D] Pre-converted depth not found at %s, using intermediate dir", pre_depth_dir)
+    else:
+        depth_dir = intermediate_dir / "depth"
+    
     depth_vis_path = depth_dir / "depth_vis.mp4"
-    undet_dir = output_dir / "undetected_frames"; _ensure_dir(undet_dir)
+    undet_dir = intermediate_dir / "undetected_frames"; _ensure_dir(undet_dir)
 
     # 1) 深度
-    vda_ready = (depth_dir / "pred_depth_000000.npy").exists()
-    if (not depth_vis_path.exists()) or (not vda_ready):
-        log.info("[3D] Generating/Checking depth …")
+    # 检查是否已有深度文件（来自 MoGe2 转换）
+    depth_files_exist = list(depth_dir.glob("pred_depth_*.npy"))
+    vda_ready = len(depth_files_exist) > 0
+    
+    if not vda_ready:
+        # 如果没有深度文件，使用 VDA 生成
+        log.info("[3D] No depth files found, generating with VDA …")
         generate_depth_video_vda(video_path, depth_dir, device=device, encoder=encoder)
     else:
-        log.info("[3D] Reusing cached depth in %s", depth_dir)
+        log.info("[3D] Found %d existing depth files in %s (from MoGe2 conversion)", 
+                 len(depth_files_exist), depth_dir)
 
-    # 1.5) 自检 + 修复
-    max_repairs = 5
-    for attempt in range(max_repairs):
-        bad = _invalid_depth_indices(depth_dir)
-        if not bad:
-            break
-        total = len(_list_depth_tensors(depth_dir)) or 1
-        log.warning("[depth] %d invalid (%.1f%%) – repairing (%d/%d)", len(bad), len(bad)/total*100, attempt+1, max_repairs)
-        _remove_depth_tensors(depth_dir, bad)
-        generate_depth_video_vda(video_path, depth_dir, device=device, encoder=encoder)
-    else:
-        raise RuntimeError(f"Depth repair failed after {max_repairs} attempts")
+    # 1.5) 自检（但不修复，因为 MoGe2 深度已经转换好了）
+    # 如果深度文件来自 MoGe2，只检查不修复
+    bad = _invalid_depth_indices(depth_dir)
+    if bad:
+        total = len(list(depth_dir.glob("pred_depth_*.npy"))) or 1
+        log.warning("[depth] %d invalid depth files (%.1f%%) found, but skipping repair "
+                   "since using MoGe2 metric depth", len(bad), len(bad)/total*100)
+        # 注意：不删除或重新生成，因为 MoGe2 深度已经转换好了
 
     # 2) 点云
-    pcd_dir = output_dir / "pointclouds" / video_name
+    pcd_dir = intermediate_dir / "pointclouds" / video_name
     if not (pcd_dir / "0.ply").exists():
         log.info("[PCD] Building …")
         _generate_pointclouds(depth_dir, video_path, pcd_dir)
@@ -721,7 +880,7 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
         log.info("[PCD] Reusing %s", pcd_dir)
 
     # 3) 相机系手腕
-    cam_hand_dir = output_dir / "hand3d_cam"; _ensure_dir(cam_hand_dir)
+    cam_hand_dir = intermediate_dir / "hand3d_cam"; _ensure_dir(cam_hand_dir)
     cam_hand_json = cam_hand_dir / f"{video_name}.json"
 
     cap = cv2.VideoCapture(video_path)
@@ -732,22 +891,37 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
     cam_track: Dict[str, List[float]] = {}
     prev_cam = None
     speed_cam: Dict[int, float] = {}
+    
+    # 诊断统计
+    stats = {
+        "total_frames": total_frames,
+        "frame_read_failed": 0,
+        "depth_missing": 0,
+        "wrist_detection_failed": 0,
+        "depth_extraction_failed": 0,
+        "success": 0
+    }
 
     for idx in range(total_frames):
         ok, frame = cap.read()
         if not ok:
+            stats["frame_read_failed"] += 1
             speed_cam[idx] = 0.0
             prev_cam = None
             continue
         depth = _load_depth(depth_dir, idx)
         if depth is None:
+            stats["depth_missing"] += 1
             speed_cam[idx] = 0.0
             prev_cam = None
             continue
 
         H, W = depth.shape
-        wrist = _wrist_from_frame(frame, depth, cpm)
+        # 使用 HaMeR 方法检测手腕（不依赖深度图）
+        detector = _get_body_detector()
+        wrist = _wrist_from_frame(frame, depth, cpm, detector=detector)
         if wrist is None:
+            stats["wrist_detection_failed"] += 1
             speed_cam[idx] = 0.0
             prev_cam = None
             continue
@@ -760,14 +934,22 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
             prev_z=prev_z,
             win=3,  # 窗口半径3 -> 7x7
             drop_extreme_ratio=0.1,  # 剔除前10%最大+最小
-            max_jump=1.0,  # 每帧深度最多跳 20 cm
-            debug=True,  # 调试时可以先 True 看打印
+            max_jump=1.0,  # 每帧深度最多跳 1.0 m
+            debug=False,  # 关闭调试输出以减少日志
             frame_idx=idx,
             hand_side="L"
         )
+        
+        # 如果深度获取失败，跳过该帧
+        if z_m is None:
+            stats["depth_extraction_failed"] += 1
+            speed_cam[idx] = 0.0
+            prev_cam = None
+            continue
+        
+        stats["success"] += 1
         prev_z = z_m  # ★ 更新上一帧深度
         z_mm = z_m * 1000.0
-        # z_mm = float(depth[vi, ui]) * 1000.0
         X, Y, Z = _pixel_to_camera(u, v, z_mm, W, H)
         cam_track[str(idx+1)] = [float(X), float(Y), float(Z)]
 
@@ -781,53 +963,211 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
 
         if (idx+1) % 100 == 0 or idx == total_frames-1:
             log.info("[3D] Frames %d/%d", idx+1, total_frames)
+    
+    # 输出详细统计
+    log.info("[DIAG] Frame processing statistics:")
+    log.info("  Total frames: %d", stats["total_frames"])
+    log.info("  Frame read failed: %d (%.1f%%)", 
+             stats["frame_read_failed"], stats["frame_read_failed"]/stats["total_frames"]*100)
+    log.info("  Depth missing: %d (%.1f%%)", 
+             stats["depth_missing"], stats["depth_missing"]/stats["total_frames"]*100)
+    log.info("  Wrist detection failed: %d (%.1f%%)", 
+             stats["wrist_detection_failed"], stats["wrist_detection_failed"]/stats["total_frames"]*100)
+    log.info("  Depth extraction failed: %d (%.1f%%)", 
+             stats["depth_extraction_failed"], stats["depth_extraction_failed"]/stats["total_frames"]*100)
+    log.info("  Successfully processed: %d (%.1f%%)", 
+             stats["success"], stats["success"]/stats["total_frames"]*100)
 
     cap.release()
     _atomic_json_dump(cam_hand_json, cam_track)
+    
+    # 统计信息
+    detected_frames = len(cam_track)
+    log.info("[CAM] Camera-frame tracking: %d/%d frames (%.1f%%)", 
+             detected_frames, total_frames, detected_frames/total_frames*100 if total_frames > 0 else 0)
+    
+    # 输出前10帧的检测状态作为示例
+    if detected_frames > 0:
+        sample_frames = sorted(cam_track.keys(), key=int)[:min(10, len(cam_track))]
+        log.info("[CAM] Sample camera coordinates (first 10 detected frames):")
+        for frame_id in sample_frames:
+            xyz = cam_track[frame_id]
+            log.info("  Frame %s: [%.3f, %.3f, %.3f]", frame_id, xyz[0], xyz[1], xyz[2])
 
     # 4) 注册到世界坐标
-    reg_dir = output_dir / "registered_hands"; _ensure_dir(reg_dir)
-    register_hand_positions(str(pcd_dir), str(cam_hand_dir), str(reg_dir))
+    reg_dir = intermediate_dir / "registered_hands"; _ensure_dir(reg_dir)
+    # register_hand_positions 期望 pcd_root 包含视频子目录，所以传入 pointclouds 目录
+    pcd_root = pcd_dir.parent  # pointclouds 目录
+    register_hand_positions(str(pcd_root), str(cam_hand_dir), str(reg_dir))
     reg_json = reg_dir / f"{video_name}.json"
     if not reg_json.exists():
         log.warning("[REG] Registration output missing; using camera-frame track.")
         reg_track = cam_track
     else:
         reg_track = json.loads(reg_json.read_text(encoding="utf-8"))
+    
+    registered_frames = len(reg_track)
+    log.info("[REG] Registered %d/%d frames (%.1f%%)", 
+             registered_frames, total_frames, registered_frames/total_frames*100 if total_frames > 0 else 0)
+    
+    # 输出配准后的示例坐标
+    if registered_frames > 0:
+        sample_frames = sorted(reg_track.keys(), key=int)[:min(10, len(reg_track))]
+        log.info("[REG] Sample registered coordinates (first 10 frames):")
+        for frame_id in sample_frames:
+            xyz = reg_track[frame_id]
+            log.info("  Frame %s: [%.3f, %.3f, %.3f]", frame_id, xyz[0], xyz[1], xyz[2])
 
-    # 5) 世界系速度
+    # 5) 对注册后的坐标进行插值（填充缺失帧）
+    def interpolate_hand_positions(hand_dict: Dict[str, List[float]], total_frames: int) -> Dict[int, List[float]]:
+        """
+        对缺失的手部位置进行线性插值。
+        
+        Args:
+            hand_dict: dict mapping frame index (str) to [x, y, z]
+            total_frames: 总帧数
+        
+        Returns:
+            dict mapping frame index (int) to [x, y, z]，所有帧都有值（通过插值填充）
+        """
+        if not hand_dict:
+            return {}
+        
+        # 提取有效帧和坐标
+        valid_frames = []
+        valid_coords = []
+        for frame_str, coords in hand_dict.items():
+            try:
+                frame_idx = int(frame_str)
+                if 0 <= frame_idx <= total_frames and isinstance(coords, (list, tuple)) and len(coords) >= 3:
+                    valid_frames.append(frame_idx)
+                    valid_coords.append([float(coords[0]), float(coords[1]), float(coords[2])])
+            except (ValueError, TypeError, IndexError):
+                continue
+        
+        if len(valid_frames) < 2:
+            # 如果有效帧少于2个，无法插值，返回原始数据
+            return {int(k): v for k, v in hand_dict.items() if isinstance(v, (list, tuple)) and len(v) >= 3}
+        
+        valid_frames = np.array(valid_frames, dtype=int)
+        valid_coords = np.array(valid_coords, dtype=float)  # (N, 3)
+        
+        # 构建完整的帧序列
+        min_f, max_f = int(valid_frames.min()), int(valid_frames.max())
+        all_frames = np.arange(min_f, max_f + 1, dtype=int)
+        
+        # 构建位置数组，缺失帧用 NaN 填充
+        pos = np.full((len(all_frames), 3), np.nan, dtype=float)
+        frame_to_idx = {f: i for i, f in enumerate(all_frames)}
+        
+        for f, coords in zip(valid_frames, valid_coords):
+            if f in frame_to_idx:
+                pos[frame_to_idx[f]] = coords
+        
+        # 对每个坐标轴做线性插值填充 NaN
+        for d in range(3):
+            arr = pos[:, d]
+            nans = np.isnan(arr)
+            if np.all(nans):
+                continue
+            valid_idx = np.where(~nans)[0]
+            if len(valid_idx) < 2:
+                continue
+            valid_vals = arr[valid_idx]
+            # 使用 np.interp 进行线性插值
+            interp_vals = np.interp(np.arange(len(arr)), valid_idx, valid_vals)
+            arr[nans] = interp_vals[nans]
+            pos[:, d] = arr
+        
+        # 构建结果字典（只包含插值后的有效值）
+        interpolated = {}
+        for i, frame_idx in enumerate(all_frames):
+            if np.all(np.isfinite(pos[i])):
+                interpolated[frame_idx] = [float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2])]
+        
+        return interpolated
+    
+    # 对注册后的坐标进行插值
+    reg_track_interpolated = interpolate_hand_positions(reg_track, total_frames)
+    # 计算插值帧数：插值后有的帧 - 原始有的帧
+    original_frame_set = {int(k) for k in reg_track.keys() if k.isdigit() or isinstance(k, int)}
+    interpolated_frame_set = set(reg_track_interpolated.keys())
+    interpolated_count = len(interpolated_frame_set - original_frame_set)
+    if interpolated_count > 0:
+        log.info("[INTERP] Interpolated %d missing frames (from %d to %d frames)", 
+                 interpolated_count, len(original_frame_set), len(interpolated_frame_set))
+    
+    # 5) 世界系速度（基于插值后的坐标）
     speed_pairs: List[List[float]] = []
     prev_w = None
+    zero_speed_count = 0
+    speed_stats = {
+        "missing_in_reg": 0,  # 配准后缺失的帧（插值前）
+        "missing_after_interp": 0,  # 插值后仍然缺失的帧
+        "first_frame": 0,     # 第一帧或前一帧缺失
+        "valid_speed": 0      # 有效速度
+    }
+    
     for idx in range(total_frames):
-        xyz = reg_track.get(str(idx+1))
+        # 优先使用插值后的坐标，如果没有则使用原始坐标
+        xyz = reg_track_interpolated.get(idx+1) or reg_track.get(str(idx+1))
         if xyz is None:
             speed = 0.0
             prev_w = None
+            zero_speed_count += 1
+            if str(idx+1) not in reg_track:
+                speed_stats["missing_in_reg"] += 1
+            else:
+                speed_stats["missing_after_interp"] += 1
         else:
             if prev_w is None:
                 speed = 0.0
+                zero_speed_count += 1
+                speed_stats["first_frame"] += 1
             else:
                 dx, dy, dz = np.array(xyz) - np.array(prev_w)
                 speed = float(np.linalg.norm([dx,dy,dz]))
+                speed_stats["valid_speed"] += 1
             prev_w = xyz
         speed_pairs.append([idx, speed])
+    
+    log.info("[SPEED] Speed calculation statistics:")
+    log.info("  Missing in registration (before interpolation): %d (%.1f%%)", 
+             speed_stats["missing_in_reg"], speed_stats["missing_in_reg"]/total_frames*100)
+    log.info("  Missing after interpolation: %d (%.1f%%)", 
+             speed_stats["missing_after_interp"], speed_stats["missing_after_interp"]/total_frames*100)
+    log.info("  First frame or gap: %d (%.1f%%)", 
+             speed_stats["first_frame"], speed_stats["first_frame"]/total_frames*100)
+    log.info("  Valid speed: %d (%.1f%%)", 
+             speed_stats["valid_speed"], speed_stats["valid_speed"]/total_frames*100)
+    log.info("  Total zero speed: %d/%d frames (%.1f%%)", 
+             zero_speed_count, total_frames, 
+             zero_speed_count/total_frames*100 if total_frames > 0 else 0)
 
     # 6) 输出
+    # output_dir 已经是正确的输出目录（调用时已设置为 speed_output_dir）
     speed_json_path = output_dir / f"{video_name}_with_speed.json"
     _atomic_json_dump(speed_json_path, speed_pairs)
 
-    plt.figure(figsize=(12, 4))
-    xs = [p[0] for p in speed_pairs]
-    ys = [p[1] for p in speed_pairs]
-    plt.plot(xs, ys, label="3D Hand Speed (world)")
-    plt.xlabel("Frame"); plt.ylabel("Speed (relative)")
-    plt.tight_layout()
-    speed_vis_path = output_dir / f"{video_name}_speed_vis.png"
-    plt.savefig(speed_vis_path); plt.close()
+    # 速度可视化图（如果不需要可以跳过）
+    if speed_only:
+        speed_vis_path = ""  # 不生成可视化图
+        depth_vis_path_str = ""  # 不生成深度可视化
+    else:
+        plt.figure(figsize=(12, 4))
+        xs = [p[0] for p in speed_pairs]
+        ys = [p[1] for p in speed_pairs]
+        plt.plot(xs, ys, label="3D Hand Speed (world)")
+        plt.xlabel("Frame"); plt.ylabel("Speed (relative)")
+        plt.tight_layout()
+        speed_vis_path = output_dir / f"{video_name}_speed_vis.png"
+        plt.savefig(speed_vis_path); plt.close()
+        # depth_vis_path 在前面已经定义过了
+        depth_vis_path_str = str(depth_vis_path) if depth_vis_path.exists() else ""
 
-    return speed_pairs, str(speed_json_path), str(speed_vis_path), str(depth_vis_path)
+    return speed_pairs, str(speed_json_path), str(speed_vis_path), depth_vis_path_str
 
-def batch_process_videos(video_folder: str, output_root: str, device="cuda", encoder="vits"):
+def batch_process_videos(video_folder: str, output_root: str, device="cuda", encoder="vits", depth_root: Optional[str] = None, speed_only: bool = False):
 
     video_folder = Path(video_folder)
     output_root = Path(output_root)
@@ -847,15 +1187,30 @@ def batch_process_videos(video_folder: str, output_root: str, device="cuda", enc
 
     for video_path in videos:
         video_name = video_path.stem
-        outdir = output_root / video_name
+        # 如果 speed_only，中间文件用临时目录，速度 JSON 直接保存在 output_root
+        if speed_only:
+            # 中间文件保存到 depth_root 或临时目录
+            if depth_root is not None:
+                intermediate_dir = Path(depth_root) / video_name
+            else:
+                intermediate_dir = output_root / video_name
+            # 速度 JSON 保存在 output_root（不创建子目录）
+            speed_output_dir = output_root
+        else:
+            intermediate_dir = output_root / video_name
+            speed_output_dir = intermediate_dir
+        
         print(f" 处理视频: {video_name}")
 
         try:
             pairs, speed_json, speed_png, depth_vis = extract_3d_speed_and_visualize(
                 video_path=str(video_path),
-                output_dir=str(outdir),
+                output_dir=str(speed_output_dir),  # 速度 JSON 的输出目录
+                intermediate_dir=str(intermediate_dir),  # 中间文件的目录
                 device=device,
-                encoder=encoder
+                encoder=encoder,
+                depth_root=depth_root,
+                speed_only=speed_only
             )
             print(f" 完成: {video_name}")
             print(f"   ├─ 速度JSON: {speed_json}")
@@ -871,3 +1226,107 @@ def batch_process_videos(video_folder: str, output_root: str, device="cuda", enc
     print(f" 成功 {len(success)} 个: {success}")
     print(f" 失败 {len(failed)} 个: {failed}")
 
+
+def main():
+    """命令行入口"""
+    parser = argparse.ArgumentParser(
+        description="基于 MoGe2 metric depth 计算 3D 手部速度"
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        default=None,
+        help="单个视频路径（如 /path/to/video.mp4）"
+    )
+    parser.add_argument(
+        "--video_folder",
+        type=str,
+        default=None,
+        help="视频文件夹路径（批量处理）"
+    )
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        required=True,
+        help="输出根目录（如 /home/EgoLoc/output_egoloc）"
+    )
+    parser.add_argument(
+        "--depth_root",
+        type=str,
+        default=None,
+        help="预转换的深度文件根目录（如 /home/EgoLoc/output_egoloc）。如果不指定，会在 output_root 中查找"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="计算设备（默认: cuda）"
+    )
+    parser.add_argument(
+        "--encoder",
+        type=str,
+        default="vits",
+        choices=["vits", "vitl"],
+        help="VDA encoder（默认: vits，仅在需要生成深度时使用）"
+    )
+    parser.add_argument(
+        "--speed_only",
+        action="store_true",
+        help="只输出速度 JSON 文件，中间文件（点云、可视化等）保存到其他位置"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.video_folder is not None:
+        # 批量处理
+        batch_process_videos(
+            video_folder=args.video_folder,
+            output_root=args.output_root,
+            device=args.device,
+            encoder=args.encoder,
+            depth_root=args.depth_root,
+            speed_only=args.speed_only
+        )
+    elif args.video is not None:
+        # 单个视频处理
+        video_path = Path(args.video)
+        video_name = video_path.stem
+        
+        # 如果 speed_only，中间文件用临时目录，速度 JSON 直接保存在 output_root
+        if args.speed_only:
+            if args.depth_root is not None:
+                intermediate_dir = Path(args.depth_root) / video_name
+            else:
+                intermediate_dir = Path(args.output_root) / video_name
+            speed_output_dir = Path(args.output_root)  # 速度 JSON 直接保存在根目录
+        else:
+            intermediate_dir = Path(args.output_root) / video_name
+            speed_output_dir = intermediate_dir
+        
+        print(f"处理视频: {video_name}")
+        print(f"输出目录: {speed_output_dir}")
+        
+        try:
+            pairs, speed_json, speed_png, depth_vis = extract_3d_speed_and_visualize(
+                video_path=str(video_path),
+                output_dir=str(speed_output_dir),
+                intermediate_dir=str(intermediate_dir),
+                device=args.device,
+                encoder=args.encoder,
+                depth_root=args.depth_root,
+                speed_only=args.speed_only
+            )
+            print(f"\n完成: {video_name}")
+            print(f"  ├─ 速度JSON: {speed_json}")
+            print(f"  ├─ 速度图:   {speed_png}")
+            print(f"  └─ 深度视频: {depth_vis}")
+        except Exception as e:
+            print(f"\n失败: {e}")
+            raise
+    else:
+        parser.error("必须提供 --video 或 --video_folder 其中之一")
+
+
+if __name__ == "__main__":
+    main()

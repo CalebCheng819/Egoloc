@@ -48,9 +48,11 @@ for p in paths:
     if p and p not in sys.path:
         sys.path.insert(0, p)
 
-# （可选）调试输出，确认生效
-# print("PYTHONPATH =", os.environ["PYTHONPATH"])
-# print("sys.path head =", sys.path[:5])
+from groundingdino.util.inference import load_model, load_image, predict
+_model = load_model(
+    "/home/EgoLoc/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+    "/home/EgoLoc/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"  # 直接放在weights目录外
+)
 
 
 try:
@@ -119,6 +121,69 @@ def _need(hooks: Hooks, name: str):
 # ---------------------------------------------------------------------------
 _HAMER_CACHE: Dict[str, ViTPoseModel] = {}
 
+
+def _get_body_detector(device: str = "cuda"):
+    """Return a cached Detectron2 body detector (HaMeR style)."""
+    if "detector" in _HAMER_CACHE:
+        return _HAMER_CACHE["detector"]
+
+    try:
+        # 确保 hamer 包在 sys.path 中
+        import sys
+        import importlib.util
+
+        # 尝试多种方式导入
+        try:
+            # 方式1: 标准导入（如果 hamer 已安装）
+            from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
+        except ImportError:
+            # 方式2: 直接导入文件
+            utils_detectron2_path = Path(HAMER_ROOT) / "hamer" / "utils" / "utils_detectron2.py"
+            if utils_detectron2_path.exists():
+                spec = importlib.util.spec_from_file_location("hamer.utils.utils_detectron2", utils_detectron2_path)
+                utils_detectron2_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(utils_detectron2_module)
+                DefaultPredictor_Lazy = utils_detectron2_module.DefaultPredictor_Lazy
+            else:
+                raise ImportError(f"Cannot find utils_detectron2.py at {utils_detectron2_path}")
+
+        from detectron2.config import LazyConfig
+        import hamer
+
+        # 使用 regnety 检测器（更快，内存占用更少）
+        try:
+            from detectron2 import model_zoo
+            from detectron2.config import get_cfg
+            detectron2_cfg = model_zoo.get_config(
+                'new_baselines/mask_rcnn_regnety_4gf_dds_FPN_400ep_LSJ.py',
+                trained=True
+            )
+            detectron2_cfg.model.roi_heads.box_predictor.test_score_thresh = 0.5
+            detectron2_cfg.model.roi_heads.box_predictor.test_nms_thresh = 0.4
+            detector = DefaultPredictor_Lazy(detectron2_cfg)
+            log.info("[DET] Using RegNetY detector (faster)")
+        except Exception as e:
+            # 回退到 vitdet
+            log.info("[DET] RegNetY not available, using ViTDet")
+            cfg_path = Path(hamer.__file__).parent / 'configs' / 'cascade_mask_rcnn_vitdet_h_75ep.py'
+            detectron2_cfg = LazyConfig.load(str(cfg_path))
+            # 尝试使用本地模型路径
+            local_model = "/home/hamer/models/model_final_f05665.pkl"
+            if os.path.exists(local_model):
+                detectron2_cfg.train.init_checkpoint = local_model
+            else:
+                detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
+
+            for i in range(3):
+                detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
+            detector = DefaultPredictor_Lazy(detectron2_cfg)
+
+        _HAMER_CACHE["detector"] = detector
+        return detector
+    except Exception as e:
+        log.warning(f"[DET] Failed to load Detectron2 detector: {e}")
+        log.warning("[DET] Falling back to depth-guided method")
+        return None
 def _get_vitpose_model(device: str = "cuda") -> ViTPoseModel:
     """Return a cached ViTPoseModel (no Detectron2 dependency)."""
     if "cpm" in _HAMER_CACHE:
@@ -249,263 +314,190 @@ def _pixel_to_camera(u: float, v: float, z: float, W: int, H: int):
     return X, Y, z
 
 
-# ---------------------------------------------------------------------------
-# Wrist detection helper (depth‑guided + ViTPose)
-# ---------------------------------------------------------------------------
-# def _wrist_from_frame(frame_bgr: np.ndarray, gray_depth: np.ndarray, cpm: ViTPoseModel):
-#     # 1) Depth‑based hand ROI – nearest object in view
-#     nearest = gray_depth < np.percentile(gray_depth, 15)  # closest 25 %,原来是10
-#     labels, n_lbl = ndimage.label(nearest)
-#     if n_lbl == 0:
-#         return None
-#
-#     # largest blob → hand / forearm
-#     sizes = ndimage.sum(nearest, labels, range(1, n_lbl + 1))
-#     hand_lbl = 1 + int(np.argmax(sizes))
-#     mask = labels == hand_lbl
-#     ys, xs = np.where(mask)
-#     y0, y1 = ys.min(), ys.max()
-#     x0, x1 = xs.min(), xs.max()
-#
-#     roi_bgr = frame_bgr[y0 : y1 + 1, x0 : x1 + 1]
-#
-#     # 2) ViTPose inside ROI
-#     bbox = np.array(
-#         [[0, 0, roi_bgr.shape[1] - 1, roi_bgr.shape[0] - 1, 1.0]], dtype=np.float32
-#     )
-#     pose = cpm.predict_pose(roi_bgr[:, :, ::-1], [bbox])[0]
-#
-#     hand_kpts = pose["keypoints"][-21:]  # right‑hand keypoints
-#     valid = hand_kpts[:, 2] > 0.3#原来是0.35
-#     if valid.sum() <= 3:
-#         return None
-#
-#     wrist_u = x0 + hand_kpts[0, 0]
-#     wrist_v = y0 + hand_kpts[0, 1]
-#     return float(wrist_u), float(wrist_v)
-# def _wrist_from_frame(frame_bgr: np.ndarray,
-#                        gray_depth: np.ndarray,
-#                        cpm: ViTPoseModel):
-#     # 1) 还是先做最近 15% 深度的前景，找最大连通域 ROI（假定手臂区域）
-#     nearest = gray_depth < np.percentile(gray_depth, 15)
-#     labels, n_lbl = ndimage.label(nearest)
-#     if n_lbl == 0:
-#         return {"left": None, "right": None}
-#
-#     sizes = ndimage.sum(nearest, labels, range(1, n_lbl + 1))
-#     hand_lbl = 1 + int(np.argmax(sizes))
-#     mask = labels == hand_lbl
-#     ys, xs = np.where(mask)
-#     y0, y1 = ys.min(), ys.max()
-#     x0, x1 = xs.min(), xs.max()
-#
-#     roi_bgr = frame_bgr[y0: y1 + 1, x0: x1 + 1]
-#
-#     bbox = np.array(
-#         [[0, 0, roi_bgr.shape[1] - 1, roi_bgr.shape[0] - 1, 1.0]], dtype=np.float32
-#     )
-#     pose = cpm.predict_pose(roi_bgr[:, :, ::-1], [bbox])[0]
-#     kpts = pose["keypoints"]          # (N, 3)
-#
-#     # 按 COCO-wholebody 的典型顺序切：左手 21 点 + 右手 21 点
-#     left_kpts  = kpts[-42:-21]
-#     right_kpts = kpts[-21:]
-#
-#     def _one_wrist(hand_kpts):
-#         valid = hand_kpts[:, 2] > 0.3
-#         if valid.sum() <= 3:
-#             return None
-#         wrist_u = x0 + hand_kpts[0, 0]
-#         wrist_v = y0 + hand_kpts[0, 1]
-#         return float(wrist_u), float(wrist_v)
-#
-#     left_wrist  = _one_wrist(left_kpts)
-#     right_wrist = _one_wrist(right_kpts)
-#
-#     return {"left": left_wrist, "right": right_wrist}
-# def _wrist_from_frame(frame_bgr: np.ndarray,
-#                       gray_depth: np.ndarray,
-#                       cpm: ViTPoseModel):
-#     # 1) depth 前景
-#     nearest = gray_depth < np.percentile(gray_depth, 15)
-#     labels, n_lbl = ndimage.label(nearest)
-#     if n_lbl == 0:
-#         return {"left": None, "right": None}
-#
-#     sizes = ndimage.sum(nearest, labels, range(1, n_lbl + 1))
-#     order = np.argsort(sizes)[::-1]  # 从大到小排序
-#
-#     # 最多选前两个 blob，因为你就两只手
-#     rois = []
-#     for idx in order[:2]:
-#         lbl = idx + 1
-#         mask = labels == lbl
-#         ys, xs = np.where(mask)
-#         if ys.size == 0:
-#             continue
-#         y0, y1 = ys.min(), ys.max()
-#         x0, x1 = xs.min(), xs.max()
-#         rois.append((x0, y0, x1, y1))
-#
-#     # 2) 每个 ROI 分别跑 ViTPose
-#     cand_uv = []  # [(u,v), ...]
-#     for (x0, y0, x1, y1) in rois:
-#         roi_bgr = frame_bgr[y0:y1 + 1, x0:x1 + 1]
-#         if roi_bgr.size == 0:
-#             continue
-#
-#         bbox = np.array([[0, 0,
-#                           roi_bgr.shape[1] - 1,
-#                           roi_bgr.shape[0] - 1,
-#                           1.0]], dtype=np.float32)
-#
-#         pose = cpm.predict_pose(roi_bgr[:, :, ::-1], [bbox])[0]
-#         kpts = pose["keypoints"]  # (N,3)
-#
-#         # 两边手都考虑
-#         left_kpts = kpts[-42:-21]
-#         right_kpts = kpts[-21:]
-#
-#         def _center(hand_kpts):
-#             valid = hand_kpts[:, 2] > 0.3
-#             if valid.sum() <= 3:
-#                 return None
-#             xs = hand_kpts[valid, 0]
-#             ys = hand_kpts[valid, 1]
-#             conf = hand_kpts[valid, 2]
-#             cx = float((xs * conf).sum() / conf.sum())
-#             cy = float((ys * conf).sum() / conf.sum())
-#             return x0 + cx, y0 + cy
-#
-#         uvL = _center(left_kpts)
-#         uvR = _center(right_kpts)
-#
-#         # 选择置信度高的一边
-#         if uvL is not None:
-#             cand_uv.append(uvL)
-#         elif uvR is not None:
-#             cand_uv.append(uvR)
-#
-#     # 3) 最终合并候选
-#     # cand_uv 长度可能为 0,1,2
-#     # 后续由 fix_left_right_identity 进行左右分配
-#     if len(cand_uv) == 0:
-#         return {"left": None, "right": None}
-#     elif len(cand_uv) == 1:
-#         return {"left": cand_uv[0], "right": None}
-#     else:
-#         # 用水平位置排序，u 小 = 左手
-#         if cand_uv[0][0] <= cand_uv[1][0]:
-#             return {"left": cand_uv[0], "right": cand_uv[1]}
-#         else:
-#             return {"left": cand_uv[1], "right": cand_uv[0]}
+import numpy as np
+from scipy import ndimage
+
 def _wrist_from_frame(frame_bgr: np.ndarray,
                       gray_depth: np.ndarray,
-                      cpm: ViTPoseModel,
+                      cpm: "ViTPoseModel",
                       *,
+                      detector=None,
+                      # --- Detectron2 params ---
+                      det_score_thr: float = 0.5,
+                      det_max_person: int = 2,
+                      # --- ViTPose hand params ---
                       kp_conf_thr: float = 0.3,
+                      # --- depth-guided params ---
                       max_blobs: int = 3,
-                      dup_px_thresh: float = 30.0):
+                      dup_px_thresh: float = 30.0,
+                      depth_percentile: float = 20.0,
+                      pad: int = 8,
+                      verbose: bool = True):
     """
-    改进版：对前几个连通域分别跑 ViTPose，但保留每个 ROI 的 left/right 候选，
-    然后做基于像素距离的去重与合并，最后返回 {'left':(u,v)|None, 'right':(u,v)|None}.
-    参数可以按需调（dup_px_thresh 单位：像素）。
+    Detectron2 优先：检测人框 -> ViTPose -> 左右手中心点
+    失败则回退 depth-guided 多 blob：最近深度前景 -> 多 ROI -> ViTPose -> 合并去重
+
+    Returns:
+      dict: {'left': (u,v) or None, 'right': (u,v) or None}
     """
-    # 1) depth 前景
-    nearest = gray_depth < np.percentile(gray_depth, 20)
+
+    def _log(msg: str):
+        if verbose:
+            print(msg)
+
+    # helper：把一堆候选点去重合并，再按水平位置/side输出
+    def _merge_and_assign(cand_uv):
+        if not cand_uv:
+            return {"left": None, "right": None}
+
+        merged = []
+        used = [False] * len(cand_uv)
+        for i, ci in enumerate(cand_uv):
+            if used[i]:
+                continue
+            ux, vy, sc, side = ci
+            group = [i]
+            for j in range(i + 1, len(cand_uv)):
+                if used[j]:
+                    continue
+                ux2, vy2, sc2, side2 = cand_uv[j]
+                d = float(np.hypot(ux - ux2, vy - vy2))
+                if d < dup_px_thresh:
+                    group.append(j)
+            best = max(group, key=lambda k: cand_uv[k][2])
+            merged.append(cand_uv[best])
+            for k in group:
+                used[k] = True
+
+        merged = sorted(merged, key=lambda x: x[2], reverse=True)[:2]
+
+        if len(merged) == 1:
+            u, v, s, guessed_side = merged[0]
+            # 单候选先放 left（外层可用 prev 修正身份）
+            return {"left": (u, v), "right": None}
+
+        a, b = merged[0], merged[1]
+        # 按 x 排左右（更稳；side 作为参考，不强绑定）
+        if a[0] <= b[0]:
+            return {"left": (a[0], a[1]), "right": (b[0], b[1])}
+        else:
+            return {"left": (b[0], b[1]), "right": (a[0], a[1])}
+
+    # helper：从 hand kpts 计算带权中心 + 平均置信度
+    def _center_and_conf(hand_kpts, x0=0.0, y0=0.0):
+        valid = hand_kpts[:, 2] > kp_conf_thr
+        if valid.sum() <= 3:
+            return None
+        xs = hand_kpts[valid, 0]
+        ys = hand_kpts[valid, 1]
+        conf = hand_kpts[valid, 2]
+        cx = float((xs * conf).sum() / (conf.sum() + 1e-8))
+        cy = float((ys * conf).sum() / (conf.sum() + 1e-8))
+        score = float(conf.mean())
+        return (x0 + cx, y0 + cy, score)
+
+    # ============================================================
+    # 1) Detectron2 路径：人框 -> ViTPose -> 左/右手中心点
+    # ============================================================
+    if detector is not None:
+        try:
+            det_out = detector(frame_bgr)
+            inst = det_out["instances"]
+
+            # person class=0
+            valid = (inst.pred_classes == 0) & (inst.scores >= det_score_thr)
+            if valid.sum() == 0:
+                _log(f"[WRIST] DETECTRON2 found 0 person >= {det_score_thr:.2f}, fallback.")
+            else:
+                # 取分数最高的前 det_max_person 个
+                boxes = inst.pred_boxes.tensor[valid].detach().cpu().numpy()
+                scores = inst.scores[valid].detach().cpu().numpy()
+                order = np.argsort(scores)[::-1][:det_max_person]
+                boxes = boxes[order]
+                scores = scores[order]
+
+                # ViTPose 要 RGB
+                img_rgb = frame_bgr[:, :, ::-1]
+                bboxes_with_score = np.concatenate([boxes, scores[:, None]], axis=1).astype(np.float32)
+
+                poses = cpm.predict_pose(img_rgb, [bboxes_with_score])
+                # poses 的结构常见是：list，每个人一个 dict
+                # 你之前的代码是 vitposes_out[0]，这里更通用：遍历每个人
+                cand_uv = []
+                for pi, pose in enumerate(poses):
+                    kpts = pose["keypoints"]  # (K,3) wholebody
+                    left_kpts = kpts[-42:-21]
+                    right_kpts = kpts[-21:]
+
+                    lc = _center_and_conf(left_kpts, 0.0, 0.0)
+                    rc = _center_and_conf(right_kpts, 0.0, 0.0)
+
+                    if lc is not None:
+                        cand_uv.append((lc[0], lc[1], lc[2], "left"))
+                    if rc is not None:
+                        cand_uv.append((rc[0], rc[1], rc[2], "right"))
+
+                out = _merge_and_assign(cand_uv)
+                if out["left"] is not None or out["right"] is not None:
+                    _log("[WRIST] Using DETECTRON2+ViTPose.")
+                    return out
+                else:
+                    _log("[WRIST] DETECTRON2+ViTPose produced no valid hand kpts, fallback.")
+
+        except Exception as e:
+            _log(f"[WRIST] DETECTRON2 path failed ({type(e).__name__}: {e}), fallback.")
+
+    # ============================================================
+    # 2) Depth-guided 多 blob 兜底（你原来的逻辑）
+    # ============================================================
+    _log("[WRIST] Using DEPTH_GUIDED multi-blob+ViTPose.")
+
+    nearest = gray_depth < np.percentile(gray_depth, depth_percentile)
     labels, n_lbl = ndimage.label(nearest)
     if n_lbl == 0:
         return {"left": None, "right": None}
 
     sizes = ndimage.sum(nearest, labels, range(1, n_lbl + 1))
-    order = np.argsort(sizes)[::-1]  # 从大到小排序
+    order = np.argsort(sizes)[::-1]
 
     rois = []
-    for idx in order[:max_blobs]:  # 考虑前 max_blobs 个 blob（默认 3）
+    H, W = frame_bgr.shape[:2]
+    for idx in order[:max_blobs]:
         lbl = idx + 1
         mask = labels == lbl
         ys, xs = np.where(mask)
         if ys.size == 0:
             continue
-        y0, y1 = ys.min(), ys.max()
-        x0, x1 = xs.min(), xs.max()
-        # expand small ROI a bit，防止裁得太紧
-        pad = 8
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+
         x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
-        x1 = min(frame_bgr.shape[1]-1, x1 + pad); y1 = min(frame_bgr.shape[0]-1, y1 + pad)
+        x1 = min(W - 1, x1 + pad); y1 = min(H - 1, y1 + pad)
         rois.append((x0, y0, x1, y1))
 
-    cand_uv = []  # 收集所有候选 (u_global, v_global, score, side_str)
+    cand_uv = []
     for (x0, y0, x1, y1) in rois:
         roi_bgr = frame_bgr[y0:y1+1, x0:x1+1]
         if roi_bgr.size == 0:
             continue
-        bbox = np.array([[0, 0, roi_bgr.shape[1]-1, roi_bgr.shape[0]-1, 1.0]], dtype=np.float32)
+
+        bbox = np.array([[0, 0, roi_bgr.shape[1] - 1, roi_bgr.shape[0] - 1, 1.0]], dtype=np.float32)
         pose = cpm.predict_pose(roi_bgr[:, :, ::-1], [bbox])[0]
-        kpts = pose["keypoints"]  # (N,3)
+        kpts = pose["keypoints"]
 
         left_kpts  = kpts[-42:-21]
         right_kpts = kpts[-21:]
 
-        # helper：计算带权中心并返回 (u_global, v_global, avg_conf)
-        def _center_and_conf(hand_kpts):
-            valid = hand_kpts[:, 2] > kp_conf_thr
-            if valid.sum() <= 3:
-                return None
-            xs = hand_kpts[valid, 0]; ys = hand_kpts[valid, 1]; conf = hand_kpts[valid, 2]
-            cx = float((xs * conf).sum() / conf.sum())
-            cy = float((ys * conf).sum() / conf.sum())
-            score = float(conf.mean())  # 用平均置信度作为侧置信度
-            return (x0 + cx, y0 + cy, score)
-
-        lc = _center_and_conf(left_kpts)
-        rc = _center_and_conf(right_kpts)
+        lc = _center_and_conf(left_kpts, float(x0), float(y0))
+        rc = _center_and_conf(right_kpts, float(x0), float(y0))
 
         if lc is not None:
             cand_uv.append((lc[0], lc[1], lc[2], "left"))
         if rc is not None:
             cand_uv.append((rc[0], rc[1], rc[2], "right"))
 
-    # 若没有任何候选，直接返回
-    if not cand_uv:
-        return {"left": None, "right": None}
+    return _merge_and_assign(cand_uv)
 
-    # 2) 去重：如果两个候选在像素距离上非常接近，合并为置信度更高的那个
-    merged = []
-    used = [False] * len(cand_uv)
-    for i, ci in enumerate(cand_uv):
-        if used[i]:
-            continue
-        ux, vy, sc, side = ci
-        group = [i]
-        for j in range(i+1, len(cand_uv)):
-            if used[j]:
-                continue
-            ux2, vy2, sc2, side2 = cand_uv[j]
-            d = np.hypot(ux-ux2, vy-vy2)
-            if d < dup_px_thresh:
-                group.append(j)
-        # 选 group 里最高 score 的作为代表
-        best = max(group, key=lambda k: cand_uv[k][2])
-        merged.append(cand_uv[best])
-        for k in group:
-            used[k] = True
-
-    # 3) 如果合并后多于 2 个候选（极端情况），按置信度取 top2
-    merged = sorted(merged, key=lambda x: x[2], reverse=True)[:2]
-
-    # 4) 最终分配左右：优先用 x 值排序，但如果 prev 提供了约束应由外层 fix_left_right_identity 调整
-    if len(merged) == 1:
-        u, v, s, guessed_side = merged[0]
-        # 单候选：尽量决定为 nearest prev side 或默认 left（由外层修正）
-        return {"left": (u, v), "right": None}  # 由外层会根据 prev 修正
-    else:
-        a, b = merged[0], merged[1]
-        # 按水平位置决定左右（u 小 = 左）
-        if a[0] <= b[0]:
-            return {"left": (a[0], a[1]), "right": (b[0], b[1])}
-        else:
-            return {"left": (b[0], b[1]), "right": (a[0], a[1])}
 
 
 # ---------------------------------------------------------------------------
@@ -543,9 +535,19 @@ def _generate_pointclouds(depth_dir: Path,  video_path: str, pcd_out_dir: Path, 
         depth_m = _load_depth(depth_dir, idx)      # **same     depth   maths** everywhere
         if depth_m is None:
             continue
+        # === FIX: depth 与 RGB 必须同尺寸，否则 Open3D 会报错 ===
+        Hc, Wc = frame_rgb.shape[:2]
+        Hd, Wd = depth_m.shape[:2]
+        if (Hd != Hc) or (Wd != Wc):
+            print(f"[PCD] Resize depth {Hd}x{Wd} -> {Hc}x{Wc} (frame={idx})")
+            depth_m = cv2.resize(depth_m, (Wc, Hc), interpolation=cv2.INTER_LINEAR)
 
-        # Open3D expects depth in millimetres by default (depth_scale=1000)
-        depth_o3d = o3d.geometry.Image((depth_m * 1000).astype(np.uint16))
+        # Open3D expects uint16 depth in millimetres
+        depth_mm_u16 = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
+        depth_o3d = o3d.geometry.Image(depth_mm_u16)
+
+        # # Open3D expects depth in millimetres by default (depth_scale=1000)
+        # depth_o3d = o3d.geometry.Image((depth_m * 1000).astype(np.uint16))
         color_o3d = o3d.geometry.Image(frame_rgb)
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color_o3d, depth_o3d, depth_scale=1000.0,
@@ -650,6 +652,146 @@ VDA_DIR = REPO_ROOT / "Video-Depth-Anything"
 
 DEPTH_SCALE_M = 3.0  # pixel value 255 ↔ 3 m (linear scaling)
 MAX_FEEDBACKS = 1
+def depth_from_hand_roi_meters(
+    depth: np.ndarray,
+    box_xyxy: list,
+    *,
+    prev_z: float = None,          # meters
+    drop_extreme_ratio: float = 0.10,
+    max_jump: float = 0.10,        # meters/frame
+    ema_alpha: float = 0.60,
+    min_valid: int = 20,
+):
+    if depth is None or box_xyxy is None:
+        return prev_z
+
+    H, W = depth.shape[:2]
+    x0, y0, x1, y1 = map(int, box_xyxy)
+    x0 = max(0, min(W - 1, x0)); x1 = max(0, min(W, x1))
+    y0 = max(0, min(H - 1, y0)); y1 = max(0, min(H, y1))
+    if x1 <= x0 or y1 <= y0:
+        return prev_z
+
+    roi = depth[y0:y1, x0:x1].astype(np.float32)
+    valid = roi[np.isfinite(roi) & (roi > 0)]
+    if valid.size < min_valid:
+        return prev_z
+
+    valid.sort()
+    n = valid.size
+    k = int(drop_extreme_ratio * n)
+    valid2 = valid[k:n-k] if 2*k < n else valid
+    z_now = float(np.median(valid2))  # meters
+
+    if prev_z is not None and np.isfinite(prev_z):
+        dz = z_now - float(prev_z)
+        if abs(dz) > max_jump:
+            z_now = float(prev_z) + float(np.clip(dz, -max_jump, max_jump))
+        z_now = float(ema_alpha * z_now + (1.0 - ema_alpha) * float(prev_z))
+    return z_now
+def get_twohand_boxes_groundingdino(
+    frame_bgr: np.ndarray,
+    *,
+    model,
+    load_image_fn,
+    predict_fn,
+    box_thresh=0.30,
+    text_thresh=0.25,
+    expand_ratio=0.20,
+    prev_box_L=None,
+    prev_box_R=None,
+):
+    H, W = frame_bgr.shape[:2]
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        cv2.imwrite(tmp.name, frame_bgr)
+        pil_img, tensor_img = load_image_fn(tmp.name)
+
+    boxes_norm, logits, phrases = predict_fn(
+        model=model,
+        image=tensor_img,
+        caption="hand",
+        box_threshold=box_thresh,
+        text_threshold=text_thresh
+    )
+    if boxes_norm is None or len(boxes_norm) == 0:
+        return None, None, prev_box_L, prev_box_R
+
+    def xyxy_from_cxcywh_norm(b):
+        cx, cy, bw, bh = b
+        x0 = int((cx - bw/2) * W); y0 = int((cy - bh/2) * H)
+        x1 = int((cx + bw/2) * W); y1 = int((cy + bh/2) * H)
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return [x0, y0, x1, y1]
+
+    def box_center_x(box):
+        return (box[0] + box[2]) / 2.0
+
+    def iou(a, b):
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        ix0, iy0 = max(ax0,bx0), max(ay0,by0)
+        ix1, iy1 = min(ax1,bx1), min(ay1,by1)
+        iw, ih = max(0, ix1-ix0), max(0, iy1-iy0)
+        inter = iw*ih
+        area_a = (ax1-ax0)*(ay1-ay0)
+        area_b = (bx1-bx0)*(by1-by0)
+        return inter / (area_a + area_b - inter + 1e-6)
+
+    def expand(box):
+        x0,y0,x1,y1 = box
+        w = x1-x0; h = y1-y0
+        ex = int(w * expand_ratio); ey = int(h * expand_ratio)
+        x0 = max(0, x0-ex); y0 = max(0, y0-ey)
+        x1 = min(W, x1+ex); y1 = min(H, y1+ey)
+        return [x0,y0,x1,y1]
+
+    candidates = []
+    for k, b in enumerate(boxes_norm):
+        box = xyxy_from_cxcywh_norm(b)
+        if box is None:
+            continue
+        score = float(logits[k]) if logits is not None and len(logits) > k else 0.0
+        candidates.append((box, score))
+
+    if not candidates:
+        return None, None, prev_box_L, prev_box_R
+
+    # 有 prev_box：优先 IoU 匹配，避免左右互换
+    used = set()
+    boxL = None; boxR = None
+
+    if prev_box_L is not None:
+        ranked = sorted([(i, iou(candidates[i][0], prev_box_L), candidates[i][1]) for i in range(len(candidates))],
+                        key=lambda x: (x[1], x[2]), reverse=True)
+        for i, _, _ in ranked:
+            if i not in used:
+                boxL = candidates[i][0]; used.add(i); break
+
+    if prev_box_R is not None:
+        ranked = sorted([(i, iou(candidates[i][0], prev_box_R), candidates[i][1]) for i in range(len(candidates))],
+                        key=lambda x: (x[1], x[2]), reverse=True)
+        for i, _, _ in ranked:
+            if i not in used:
+                boxR = candidates[i][0]; used.add(i); break
+
+    # 缺失就按 x 排序补齐
+    remaining = [candidates[i] for i in range(len(candidates)) if i not in used]
+    if boxL is None and remaining:
+        boxL = sorted(remaining, key=lambda bs: box_center_x(bs[0]))[0][0]
+    if boxR is None and remaining:
+        boxR = sorted(remaining, key=lambda bs: box_center_x(bs[0]))[-1][0]
+
+    if boxL is not None: boxL = expand(boxL)
+    if boxR is not None: boxR = expand(boxR)
+
+    new_prev_L = boxL if boxL is not None else prev_box_L
+    new_prev_R = boxR if boxR is not None else prev_box_R
+    return boxL, boxR, new_prev_L, new_prev_R
 
 
 # ---------------------------------------------------------------------------
@@ -682,163 +824,7 @@ def _is_invalid_inv(inv: np.ndarray) -> bool:
     """
     return (not np.isfinite(inv).any()) or np.nanstd(inv) < 1e-4
 
-# def extract_3d_speed_and_visualize(
-#     video_path: str,
-#     output_dir: str,
-#     *,
-#     device: str = "cuda",
-#     encoder: str = "vits",
-#     hooks: Hooks,
-# ) -> Tuple[List[List[float]], str, str, str]:
-#     """
-#     计算 3D 手速并产出:
-#       - speed_pairs: [[frame, speed], ...]   （与 *_with_speed.json 的格式一致）
-#       - speed_json_path: <output_dir>/<video_name>_with_speed.json
-#       - speed_vis_path:  <output_dir>/<video_name>_speed_vis.png
-#       - depth_vis_path:  <output_dir>/depth/depth_vis.mp4
-#
-#     依赖通过 hooks 提供，必须包含：
-#       _get_vitpose_model, generate_depth_video_vda, _invalid_depth_indices,
-#       _remove_depth_tensors, _load_depth, _wrist_from_frame, _pixel_to_camera,
-#       _generate_pointclouds, register_hand_positions
-#     """
-#     # 取出 hook
-#     _get_vitpose_model   = _need(hooks, "_get_vitpose_model")
-#     generate_depth_video_vda = _need(hooks, "generate_depth_video_vda")
-#     _invalid_depth_indices   = _need(hooks, "_invalid_depth_indices")
-#     _remove_depth_tensors    = _need(hooks, "_remove_depth_tensors")
-#     _load_depth              = _need(hooks, "_load_depth")
-#     _wrist_from_frame        = _need(hooks, "_wrist_from_frame")
-#     _pixel_to_camera         = _need(hooks, "_pixel_to_camera")
-#     _generate_pointclouds    = _need(hooks, "_generate_pointclouds")
-#     register_hand_positions  = _need(hooks, "register_hand_positions")
-#
-#     cpm = _get_vitpose_model(device)
-#
-#     output_dir = Path(output_dir)
-#     output_dir.mkdir(parents=True, exist_ok=True)
-#     video_name = Path(video_path).stem
-#
-#     depth_dir = output_dir / "depth"
-#     depth_vis_path = depth_dir / "depth_vis.mp4"
-#     undet_dir = output_dir / "undetected_frames"
-#     undet_dir.mkdir(parents=True, exist_ok=True)
-#
-#     vda_ready = (depth_dir / "pred_depth_000000.npy").exists()
-#     if (not depth_vis_path.exists()) or (not vda_ready):
-#         log.info("[3D] Generating depth (tensors + video)…")
-#         depth_dir.mkdir(parents=True, exist_ok=True)
-#         generate_depth_video_vda(video_path, depth_dir, device=device, encoder=encoder)
-#     else:
-#         log.info("[3D] Reusing cached depth in %s", depth_dir)
-#
-#     # ---- 深度质量检查 + 自动修复 ----
-#     max_repairs = 5
-#     for attempt in range(max_repairs):
-#         bad_idx = _invalid_depth_indices(depth_dir)
-#         if not bad_idx:
-#             break
-#         total = len(list(depth_dir.glob("pred_depth_*.npy"))) or 1
-#         pct = len(bad_idx) / total * 100
-#         log.warning("[depth] %d tensors invalid (%.1f%%) – repairing (%d/%d)",
-#                     len(bad_idx), pct, attempt + 1, max_repairs)
-#         _remove_depth_tensors(depth_dir, bad_idx)
-#         generate_depth_video_vda(video_path, depth_dir, device=device, encoder=encoder)
-#     else:
-#         raise RuntimeError(f"Depth repair failed after {max_repairs} attempts")
-#
-#     # ---- 点云构建 ----
-#     pcd_dir = output_dir / "pointclouds" / video_name
-#     pcd_dir.mkdir(parents=True, exist_ok=True)
-#     if not (pcd_dir / "0.ply").exists():
-#         log.info("[PCD] Building point clouds…")
-#         _generate_pointclouds(depth_dir, video_path, pcd_dir)
-#     else:
-#         log.info("[PCD] Reusing cached point clouds in %s", pcd_dir)
-#
-#     # ---- 相机系手腕坐标 & 注册到世界系 ----
-#     cam_hand_dir = output_dir / "hand3d_cam"
-#     cam_hand_dir.mkdir(parents=True, exist_ok=True)
-#     cam_hand_json = cam_hand_dir / f"{video_name}.json"
-#
-#     cap_rgb = cv2.VideoCapture(video_path)
-#     if not cap_rgb.isOpened():
-#         raise RuntimeError(f"Could not open RGB video: {video_path}")
-#
-#     total_frames = int(cap_rgb.get(cv2.CAP_PROP_FRAME_COUNT))
-#     cam_hand: Dict[str, List[float]] = {}
-#     prev_xyz_cam = None
-#
-#     for idx in range(total_frames):
-#         ok_rgb, frame_bgr = cap_rgb.read()
-#         if not ok_rgb:
-#             prev_xyz_cam = None
-#             continue
-#
-#         gray_depth = _load_depth(depth_dir, idx)
-#         if gray_depth is None:
-#             prev_xyz_cam = None
-#             # 可选：cv2.imwrite(str(undet_dir / f"{video_name}_DEPTHMISS_{idx:06d}.png"), frame_bgr)
-#             continue
-#
-#         H, W = gray_depth.shape
-#         wrist = hooks["_wrist_from_frame"](frame_bgr, gray_depth, cpm)
-#         if wrist is None:
-#             prev_xyz_cam = None
-#             # 可选：cv2.imwrite(str(undet_dir / f"{video_name}_NOWRIST_{idx:06d}.png"), frame_bgr)
-#             continue
-#
-#         u, v = wrist
-#         u_i, v_i = min(max(int(u), 0), W - 1), min(max(int(v), 0), H - 1)
-#         z = float(gray_depth[v_i, u_i]) * 1000.0  # m->mm（按你原意）
-#         X, Y, Z = _pixel_to_camera(u, v, z, W, H)
-#         cam_hand[str(idx + 1)] = [float(X), float(Y), float(Z)]
-#
-#         if (idx + 1) % 100 == 0 or idx == total_frames - 1:
-#             log.info("[3D] Processed %d/%d frames", idx + 1, total_frames)
-#
-#     cap_rgb.release()
-#     _atomic_json_dump(cam_hand_json, cam_hand)
-#
-#     reg_out_dir = output_dir / "registered_hands"
-#     reg_out_dir.mkdir(parents=True, exist_ok=True)
-#     register_hand_positions(str(pcd_dir.parent), str(cam_hand_dir), str(reg_out_dir))
-#
-#     reg_json = reg_out_dir / f"{video_name}.json"
-#     if not reg_json.exists():
-#         raise RuntimeError(f"Registration output missing: {reg_json}")
-#     reg_hand = json.loads(reg_json.read_text(encoding="utf-8"))
-#
-#     # ---- 世界系速度（与下游对齐：[[frame, speed], ...] & *_with_speed.json）----
-#     speed_pairs: List[List[float]] = []
-#     prev_xyz_world = None
-#     for idx in range(total_frames):
-#         xyz = reg_hand.get(str(idx + 1), reg_hand.get(idx + 1, None))
-#         if xyz is None:
-#             speed = 0.0
-#             prev_xyz_world = None
-#         else:
-#             if prev_xyz_world is None:
-#                 speed = 0.0
-#             else:
-#                 dx, dy, dz = np.array(xyz, dtype=float) - np.array(prev_xyz_world, dtype=float)
-#                 speed = float(np.linalg.norm([dx, dy, dz]))
-#             prev_xyz_world = xyz
-#         speed_pairs.append([int(idx), float(speed)])
-#
-#     speed_json_path = output_dir / f"{video_name}_with_speed.json"
-#     _atomic_json_dump(speed_json_path, speed_pairs)
-#
-#     # 可视化
-#     xs = [p[0] for p in speed_pairs]; ys = [p[1] for p in speed_pairs]
-#     plt.figure(figsize=(12, 4))
-#     plt.plot(xs, ys, label="3-D Hand Speed (world)")
-#     plt.xlabel("Frame"); plt.ylabel("Speed (relative)")
-#     plt.tight_layout()
-#     speed_vis_path = output_dir / f"{video_name}_speed_vis.png"
-#     plt.savefig(speed_vis_path); plt.close()
-#
-#     return speed_pairs, str(speed_json_path), str(speed_vis_path), str(depth_vis_path)
+
 def fix_left_right_identity(wrists, prev_L, prev_R):
     """
     wrists: {"left": (u,v) or None, "right": (u,v) or None}
@@ -965,6 +951,21 @@ def robust_depth_at(
         print(f"  median z = {z:.3f}")
 
     return z
+def compute_central_speed(pos_dict, total_frames):
+    """
+    使用 central difference:
+    v_t = ||p_{t+1} - p_{t-1}|| / 2
+    """
+    speed = {}
+    for t in range(total_frames):
+        if (t - 1) in pos_dict and (t + 1) in pos_dict:
+            p_prev = pos_dict[t - 1]
+            p_next = pos_dict[t + 1]
+            v = np.linalg.norm(p_next - p_prev) / 2.0
+            speed[t] = float(v)
+        else:
+            speed[t] = 0.0
+    return speed
 
 
 def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: str = "cuda", encoder: str = "vits") -> Tuple[List[List[float]], str, str, str]:
@@ -1043,6 +1044,10 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
     wrist2d_R: Dict[str, List[float]] = {}
     prev_zL = None  # 上一帧左手的深度（米）
     prev_zR = None  # 上一帧右手的深度（米）
+    cam_positions_L = {}
+    cam_positions_R = {}
+    prev_box_L = None
+    prev_box_R = None
 
     for idx in range(total_frames):
         ok, frame = cap.read()
@@ -1053,6 +1058,27 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
             prev_cam_R = None
             continue
         depth = _load_depth(depth_dir, idx)
+        # --- 用 DINO 获取左右手框（带 prev_box 稳定） ---
+        boxL, boxR, prev_box_L, prev_box_R = get_twohand_boxes_groundingdino(
+            frame,
+            model=_model,
+            load_image_fn=load_image,
+            predict_fn=predict,
+            box_thresh=0.30,
+            text_thresh=0.25,
+            expand_ratio=0.20,
+            prev_box_L=prev_box_L,
+            prev_box_R=prev_box_R,
+        )
+
+        # --- ROI 鲁棒深度（单位：m） ---
+        zL_m = depth_from_hand_roi_meters(depth, boxL, prev_z=prev_zL) if boxL is not None else None
+        zR_m = depth_from_hand_roi_meters(depth, boxR, prev_z=prev_zR) if boxR is not None else None
+
+        # 更新上一帧深度（m）
+        prev_zL = zL_m if zL_m is not None else prev_zL
+        prev_zR = zR_m if zR_m is not None else prev_zR
+
         if depth is None:
             speed_cam[idx] = 0.0
             # prev_cam = None
@@ -1061,7 +1087,9 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
             continue
 
         H, W = depth.shape
-        wrists = _wrist_from_frame(frame, depth, cpm)
+        # wrists = _wrist_from_frame(frame, depth, cpm)
+        detector = _get_body_detector()
+        wrists= _wrist_from_frame(frame, depth, cpm, detector=detector, verbose=True)
         wrists = fix_left_right_identity(wrists, prev_uL, prev_uR)
         lw = wrists["left"]
         rw = wrists["right"]
@@ -1088,51 +1116,49 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
 
         H, W = depth.shape
 
-        # u, v = wrist
-        # ui = min(max(int(u), 0), W-1)
-        # vi = min(max(int(v), 0), H-1)
-        # z_mm = float(depth[vi, ui]) * 1000.0
-        # X, Y, Z = _pixel_to_camera(u, v, z_mm, W, H)
-        # cam_track[str(idx+1)] = [float(X), float(Y), float(Z)]
-        #
-        # if prev_cam is None:
-        #     sp = 0.0
-        # else:
-        #     dX, dY, dZ = X - prev_cam[0], Y - prev_cam[1], Z - prev_cam[2]
-        #     sp = math.sqrt(dX*dX + dY*dY + dZ*dZ)
-        # speed_cam[idx] = float(sp)
-        # prev_cam = (X, Y, Z)
+
         # ------- 左手 -------
         lw = wrists["left"]
         if lw is not None:
             uL, vL = lw
             uiL = min(max(int(uL), 0), W - 1)
             viL = min(max(int(vL), 0), H - 1)
-            zL_m = robust_depth_at(
-                depth, uiL, viL,
-                prev_z=prev_zL,
-                win=3,  # 窗口半径3 -> 7x7
-                drop_extreme_ratio=0.1,  # 剔除前10%最大+最小
-                max_jump=0.1,  # 每帧深度最多跳 20 cm
-                debug=True,  # 调试时可以先 True 看打印
-                frame_idx=idx,
-                hand_side="L"
-            )
-            prev_zL = zL_m  # ★ 更新上一帧深度
-            zL_mm = zL_m * 1000.0
+            # zL_m = robust_depth_at(
+            #     depth, uiL, viL,
+            #     prev_z=prev_zL,
+            #     win=3,  # 窗口半径3 -> 7x7
+            #     drop_extreme_ratio=0.1,  # 剔除前10%最大+最小
+            #     max_jump=0.1,  # 每帧深度最多跳 20 cm
+            #     debug=True,  # 调试时可以先 True 看打印
+            #     frame_idx=idx,
+            #     hand_side="L"
+            # )
+            # prev_zL = zL_m  # ★ 更新上一帧深度
+            # zL_mm = zL_m * 1000.0
+            # zL_m 已经在上面用 ROI 算好了（单位 m）
+            if zL_m is None:
+                speed_cam_L[idx] = 0.0
+                prev_cam_L = None
+            else:
+                zL_mm = float(zL_m) * 1000.0  # m -> mm（你要求的单位转换）
+
+
             # print(idx, uL, vL, depth[viL, uiL])
             #
             # zL_mm = float(depth[viL, uiL]) * 1000.0
             XL, YL, ZL = _pixel_to_camera(uL, vL, zL_mm, W, H)
             cam_track_L[str(idx + 1)] = [float(XL), float(YL), float(ZL)]
 
-            if prev_cam_L is None:
-                spL = 0.0
-            else:
-                dX, dY, dZ = XL - prev_cam_L[0], YL - prev_cam_L[1], ZL - prev_cam_L[2]
-                spL = math.sqrt(dX * dX + dY * dY + dZ * dZ)
-            speed_cam_L[idx] = float(spL)
+            # if prev_cam_L is None:
+            #     spL = 0.0
+            # else:
+            #     dX, dY, dZ = XL - prev_cam_L[0], YL - prev_cam_L[1], ZL - prev_cam_L[2]
+            #     spL = math.sqrt(dX * dX + dY * dY + dZ * dZ)
+            # speed_cam_L[idx] = float(spL)
+            cam_positions_L[idx] = np.array([XL, YL, ZL], dtype=float)
             prev_cam_L = (XL, YL, ZL)
+
+
         else:
             speed_cam_L[idx] = 0.0
             prev_cam_L = None
@@ -1143,30 +1169,38 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
             uR, vR = rw
             uiR = min(max(int(uR), 0), W - 1)
             viR = min(max(int(vR), 0), H - 1)
-            zR_m = robust_depth_at(
-                depth, uiR, viR,
-                prev_z=prev_zR,
-                win=3,
-                drop_extreme_ratio=0.1,
-                max_jump=0.1,
-                debug=True,
-                frame_idx=idx,
-                hand_side="R"
-            )
-
-            prev_zR = zR_m  # ★ 更新上一帧深度
-            zR_mm = zR_m * 1000.0
+            # zR_m = robust_depth_at(
+            #     depth, uiR, viR,
+            #     prev_z=prev_zR,
+            #     win=3,
+            #     drop_extreme_ratio=0.1,
+            #     max_jump=0.1,
+            #     debug=True,
+            #     frame_idx=idx,
+            #     hand_side="R"
+            # )
+            #
+            # prev_zR = zR_m  # ★ 更新上一帧深度
+            # zR_mm = zR_m * 1000.0
+            if zR_m is None:
+                speed_cam_R[idx] = 0.0
+                prev_cam_R = None
+            else:
+                zR_mm = float(zR_m) * 1000.0  # m -> mm
             # zR_mm = float(depth[viR, uiR]) * 1000.0
             XR, YR, ZR = _pixel_to_camera(uR, vR, zR_mm, W, H)
             cam_track_R[str(idx + 1)] = [float(XR), float(YR), float(ZR)]
 
-            if prev_cam_R is None:
-                spR = 0.0
-            else:
-                dX, dY, dZ = XR - prev_cam_R[0], YR - prev_cam_R[1], ZR - prev_cam_R[2]
-                spR = math.sqrt(dX * dX + dY * dY + dZ * dZ)
-            speed_cam_R[idx] = float(spR)
+            # if prev_cam_R is None:
+            #     spR = 0.0
+            # else:
+            #     dX, dY, dZ = XR - prev_cam_R[0], YR - prev_cam_R[1], ZR - prev_cam_R[2]
+            #     spR = math.sqrt(dX * dX + dY * dY + dZ * dZ)
+            # speed_cam_R[idx] = float(spR)
+            # prev_cam_R = (XR, YR, ZR)
+            cam_positions_R[idx] = np.array([XR, YR, ZR], dtype=float)
             prev_cam_R = (XR, YR, ZR)
+
         else:
             speed_cam_R[idx] = 0.0
             prev_cam_R = None
@@ -1175,6 +1209,9 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
             log.info("[3D] Frames %d/%d", idx+1, total_frames)
 
     cap.release()
+    speed_cam_L = compute_central_speed(cam_positions_L, total_frames)
+    speed_cam_R = compute_central_speed(cam_positions_R, total_frames)
+
     #_atomic_json_dump(cam_hand_json, cam_track)
     _atomic_json_dump(cam_hand_json_L, cam_track_L)
     _atomic_json_dump(cam_hand_json_R, cam_track_R)
@@ -1187,40 +1224,27 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
     _atomic_json_dump(wrist2d_L_json, wrist2d_L)
     _atomic_json_dump(wrist2d_R_json, wrist2d_R)
     # 4) 注册到世界坐标
-    #reg_dir = output_dir / "registered_hands"; _ensure_dir(reg_dir)
+
     reg_dir_L = output_dir / "registered_hands_left";
     _ensure_dir(reg_dir_L)
     reg_dir_R = output_dir / "registered_hands_right";
     _ensure_dir(reg_dir_R)
     pcd_root = str((output_dir / "pointclouds"))#保证能有register_hand_positions输出
-    #register_hand_positions(str(pcd_dir), str(cam_hand_dir), str(reg_dir))
+
     register_hand_positions(str(pcd_root), str(cam_hand_dir_L), str(reg_dir_L))
     register_hand_positions(str(pcd_root), str(cam_hand_dir_R), str(reg_dir_R))
-    #reg_json = reg_dir / f"{video_name}.json"
+
     reg_json_L = reg_dir_L / f"{video_name}.json"
     reg_json_R = reg_dir_R / f"{video_name}.json"
 
     reg_track_L = json.loads(reg_json_L.read_text(encoding="utf-8")) if reg_json_L.exists() else cam_track_L
     reg_track_R = json.loads(reg_json_R.read_text(encoding="utf-8")) if reg_json_R.exists() else cam_track_R
     # 5) 世界系速度
-    # speed_pairs: List[List[float]] = []
-    # prev_w = None
+
     speed_pairs: List[List[float]] = []  # [[frame, v_left, v_right], ...]
     prev_w_L = None
     prev_w_R = None
-    # for idx in range(total_frames):
-    #     xyz = reg_track.get(str(idx+1))
-    #     if xyz is None:
-    #         speed = 0.0
-    #         prev_w = None
-    #     else:
-    #         if prev_w is None:
-    #             speed = 0.0
-    #         else:
-    #             dx, dy, dz = np.array(xyz) - np.array(prev_w)
-    #             speed = float(np.linalg.norm([dx,dy,dz]))
-    #         prev_w = xyz
-    #     speed_pairs.append([idx, speed])
+
     for idx in range(total_frames):
         # 左手
         xyzL = reg_track_L.get(str(idx + 1))
@@ -1265,7 +1289,7 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
     plt.plot(xs, ysR, label="Right Hand Speed (world)")
     plt.xlabel("Frame"); plt.ylabel("Speed (relative)")
     plt.tight_layout()
-    #speed_vis_path = output_dir / f"{video_name}_speed_vis.png"
+    
     speed_vis_path = output_dir / f"{video_name}_speed_vis_twohands.png"
     plt.savefig(speed_vis_path); plt.close()
 

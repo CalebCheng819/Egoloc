@@ -25,11 +25,11 @@ sys.path.append('/home/Egoloc/Egolocx')  # 将 /home 路径添加到模块搜索
 sys.path.append('/home/Egoloc')
 sys.path.append('/home/EgoLoc/Grounded-Segment-Anything/GroundingDINO')  # 必需
 from groundingdino.util.inference import load_model, load_image, predict
-from EgoLocx.script.long_metric import evaluate_all
+from EgoLocx.script.long_metric import evaluate_all,evaluate_all_stages
 from EgoLocx.script.compute_metric import evaluate_predictions
 import tempfile
-from egoloc_speed import extract_3d_speed_and_visualize  # 新封装的生成速度文件的函数
-from egoloc_speed import batch_process_videos  # 对文件夹内的所有视频执行extract_3d_speed_and_visualize
+from egoloc_speed_twohands import extract_3d_speed_and_visualize  # 新封装的生成速度文件的函数
+from egoloc_speed_twohands import batch_process_videos  # 对文件夹内的所有视频执行extract_3d_speed_and_visualize
 from typing import List, Optional   # ← 新增这一行
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
@@ -138,77 +138,7 @@ def _expand_xyxy(box, W, H, expand_pixels=10, expand_ratio=None):
     x0 = max(0, x0 - ex); y0 = max(0, y0 - ey)
     x1 = min(W, x1 + ex); y1 = min(H, y1 + ey)
     return [x0,y0,x1,y1]
-# def run_groundingdino_and_crop(
-#         image: np.ndarray,
-#         text_prompt: str = "hand",
-#         box_thresh: float = 0.35,
-#         text_thresh: float = 0.25,
-#         expand_pixels: int = 10
-# ) -> np.ndarray:
-#     """
-#     - 输入：OpenCV 读出的 BGR np.ndarray (H x W x C)
-#     - 输出：裁剪并 resize 回原始 HxW 的 BGR np.ndarray
-#     - expand_pixels: 裁剪框扩大的像素值
-#     """
-#     H, W = image.shape[:2]
-#
-#     # 1) 将 np.ndarray → PIL, 再用 load_image + predict
-#     #    （GroundingDINO 只接受文件或 PIL，且内部会转 Tensor 到 GPU）
-#     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-#         cv2.imwrite(tmp.name, image)
-#         pil_img, tensor_img = load_image(tmp.name)
-#     if text_prompt == "left":
-#         text_prompt="left hand"
-#     if text_prompt == "right":
-#         text_prompt="right hand"
-#
-#     # 2) predict 得到归一化的 [cx,cy,w,h]
-#     boxes_norm, logits, phrases = predict(
-#         model=_model,
-#         image=tensor_img,
-#         caption=text_prompt,
-#         box_threshold=box_thresh,
-#         text_threshold=text_thresh
-#     )
-#     # 如果没检测到
-#     if len(boxes_norm) == 0:
-#         return image
-#
-#     # 3) 转回像素坐标并筛选合法框
-#     boxes_px = []
-#     for cx, cy, bw, bh in boxes_norm:
-#         x0 = (cx - bw / 2) * W
-#         y0 = (cy - bh / 2) * H
-#         x1 = (cx + bw / 2) * W
-#         y1 = (cy + bh / 2) * H
-#         # 强制转换为 int，并做边界裁剪
-#         x0, y0, x1, y1 = map(int, [x0, y0, x1, y1])
-#         x0, y0 = max(0, x0), max(0, y0)
-#         x1, y1 = min(W, x1), min(H, y1)
-#         if x1 > x0 and y1 > y0:
-#             boxes_px.append([x0, y0, x1, y1])
-#
-#     if not boxes_px:
-#         # 没有合法框，直接返回原图
-#         return image
-#
-#     # 4) 选择面积最小的框
-#     areas = [(x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in boxes_px]
-#     idx_min = int(np.argmin(areas))
-#     x0, y0, x1, y1 = boxes_px[idx_min]
-#
-#     # 5) 扩大裁剪框（上下左右各扩大expand_pixels像素）
-#     x0_expanded = max(0, x0 - expand_pixels)
-#     y0_expanded = max(0, y0 - expand_pixels)
-#     x1_expanded = min(W, x1 + expand_pixels)
-#     y1_expanded = min(H, y1 + expand_pixels)
-#
-#     # 6) 裁剪 + resize 回原图
-#     crop = image[y0_expanded:y1_expanded, x0_expanded:x1_expanded]
-#     if crop.size == 0:
-#         return image
-#     resized = cv2.resize(crop, (W, H), interpolation=cv2.INTER_LINEAR)
-#     return resized
+
 def run_groundingdino_and_crop_stable(
     image: np.ndarray,
     hand: str = "right",               # "left" / "right" / "both"
@@ -584,87 +514,7 @@ def adaptive_sample(minima_indices, mode='linear', exp_k=0.5):
     return selected_frame
 
 
-# def extract_local_minima_frames_adaptive(
-#         video_path,
-#         folder_path="/home/EgoLoc/hand_data_drawer/twohands_test_out15",
-#         # folder_path="/home/bathroomCabinet/3D_hand_speed",
-#         output_folder="./vis_speed_curve",
-#         hand="right",
-# ):
-#     """
-#     自适应版：根据总帧数和速度自动设置四个关键参数并提取极小值帧。
-#     返回：极小值帧list、极小值帧对应速度list
-#     """
-#     # json_file = os.path.join(folder_path, f"{video_path}_with_speed_twohands.json")
-#     # if not os.path.isfile(json_file):
-#     #     print(f"❗ 文件未找到: {json_file}")
-#     #     return [], []
-#     # data = json.load(open(json_file, 'r'))
-#     json_file = os.path.join(folder_path, f"{video_path}_with_speed_twohands.json")
-#     if not os.path.isfile(json_file):
-#         print(f"❗ 文件未找到: {json_file}")
-#         return [], []
-#
-#     data = _load_speed_scalar(json_file, hand=hand)
-#     # print(data)
-#     if not isinstance(data, list) or len(data) == 0:
-#         print(f"❗ 数据为空或格式错误")
-#         return [], []
-#
-#     frames_all, speeds_all = zip(*data)
-#     frames_all = np.array(frames_all, float)
-#     speeds_all = np.array(speeds_all, float)
-#
-#     mask = np.isfinite(speeds_all) & (speeds_all > 0)
-#     frames = frames_all[mask]
-#     speeds = speeds_all[mask]
-#     N = len(speeds)
-#     if N < 4:
-#         print(f"⚠️ 有效数据太少: {N}")
-#         return [], []
-#
-#     #polyorder = max(2, int(N / 13))
-#     #修改Savitzky-Golay 输出全变成 ~0
-#     polyorder = min(3, max(2, int(N / 100)))  # 但无论如何 ≤3
-#     window_length = max(8, int(N / 7))
-#     if window_length % 2 == 0: window_length += 1
-#     window_length = min(window_length, N - (1 if N % 2 == 0 else 0))
-#     mean_speed = np.mean(speeds)
-#     spline_s = mean_speed * 1e-3
-#     min_prominence = mean_speed * 0.3
-#     min_peak_distance = max(int(N * 0.03), 2)
-#     try:
-#         speeds_sg = savgol_filter(
-#             speeds, window_length=window_length,
-#             polyorder=min(polyorder, window_length - 1), mode='nearest'
-#         )
-#     except:
-#         speeds_sg = speeds
-#     try:
-#         spl = UnivariateSpline(frames, speeds_sg, s=spline_s)
-#         frames_smooth = np.linspace(frames.min(), frames.max(), max(300, N))
-#         speeds_smooth = spl(frames_smooth)
-#     except:
-#         frames_smooth, speeds_smooth = frames, speeds_sg
-#     peaks, props = find_peaks(
-#         -speeds_smooth,
-#         prominence=min_prominence,
-#         distance=min_peak_distance
-#     )
-#     cand_frames = np.unique(np.rint(frames_smooth[peaks]).astype(int))
-#     pairs = []
-#     for f in cand_frames:
-#         idx = np.argmin(np.abs(frames - f))
-#         pairs.append((int(frames[idx]), float(speeds[idx])))
-#     pairs.sort(key=lambda x: x[1])
-#     selected = []
-#     for f, s in pairs:
-#         if all(abs(f - sf) >= min_peak_distance for sf, _ in selected):
-#             selected.append((f, s))
-#     result = [f for f, s in selected]
-#     result_speeds = [s for f, s in selected]
-#     print(f"🖨️ {video_path}提取到极小值帧（{len(result)}个）： {result}")
-#     return result, result_speeds
+
 import os
 import json
 import numpy as np
@@ -675,7 +525,7 @@ import matplotlib.pyplot as plt
 
 def extract_local_minima_frames_adaptive(
         video_path,
-        folder_path="/home/EgoLoc/hand_data_drawer/twohands_test_out15",
+        folder_path="/home/EgoLoc/hand_data_drawer/ego4d_mp4_outputs",
         output_folder="./vis_speed_curve",
         hand="right",
 ) -> Tuple[List[int], List[float]]:
@@ -718,11 +568,7 @@ def extract_local_minima_frames_adaptive(
     frames_all = np.array(frames_all, dtype=float)
     speeds_all = np.array(speeds_all, dtype=float)
 
-    # # 丢掉 speed <= 0 或 非有限值
-    # mask = np.isfinite(speeds_all) & (speeds_all > 0)
-    # frames = frames_all[mask]
-    # speeds = speeds_all[mask]
-    # N = len(speeds)
+
     # -------- 数据清洗：去掉无效值 + 去掉 speed>30 的异常点 --------
     # 你也可以把 30 抽成参数 max_speed=30.0
     max_speed = 30.0
@@ -839,33 +685,7 @@ def extract_local_minima_frames_adaptive(
     slow_thr = med - alpha * mad
     slow_thr = max(0.0, slow_thr)  # 速度不能 < 0
 
-    # # -------- 4. 在强平滑曲线上找“局部窗口极小值”作为候选 --------
-    # candidate_indices = []
-    # for i in range(N):
-    #     fi = frames[i]  # 真实帧号（0-based）
-    #     # 在“真实帧号”意义下的临近窗口：|frame - fi| <= coarse_neighborhood_frames
-    #     local_mask = np.abs(frames - fi) <= coarse_neighborhood_frames
-    #     local_vals = speeds_strong[local_mask]
-    #     if local_vals.size == 0:
-    #         continue
-    #
-    #     val_i = speeds_strong[i]
-    #     # 条件1：在这个窗口内是最小值
-    #     # if val_i > local_vals.min() + 1e-8:
-    #     #     continue
-    #     eps = 0.05 * np.median(speeds_strong)  # 或者固定 eps=0.05
-    #     if val_i > local_vals.min() + eps:
-    #         continue
-    #
-    #     # 条件2：比整体显著慢
-    #     # if val_i > slow_thr:
-    #     #     continue
-    #
-    #     candidate_indices.append(i)
-    #
-    # if not candidate_indices:
-    #     print(f"⚠️ {video_stem} 未找到局部候选极小值（强平滑曲线）")
-    #     return [], []
+
     from scipy.signal import find_peaks
 
     # ---------- 4) 在强平滑曲线上找极小值候选：find_peaks(-x) ----------
@@ -954,11 +774,7 @@ def extract_local_minima_frames_adaptive(
             frame_to_speed[f] = s
     pairs = sorted(frame_to_speed.items(), key=lambda x: x[1])  # 按速度从小到大排
 
-    # -------- 6. 按时间间隔做 NMS（min_peak_distance_frames） --------
-    # selected = []
-    # for f, s in pairs:
-    #     if all(abs(f - sf) >= min_peak_distance_frames for sf, _ in selected):
-    #         selected.append((f, s))
+
     selected = pairs[:]  # 不做 NMS，全部保留
 
     result = [f for f, s in selected]
@@ -1138,7 +954,7 @@ def select_and_filter_keyframes_with_anchor(selected_indices, total_indices, gri
 
 
 # def get_json_path(video_name, base_dir="/home/hand/3D_hand_speed"):
-def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/twohands_test_out15"):
+def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/ego4d_mp4_outputs"):
     # json_filename = f"{video_name}_with_speed.json"
     # json_path = os.path.join(base_dir, json_filename)
     # return json_path
@@ -1153,7 +969,7 @@ def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/twohands_t
     return json_path
 
 
-def get_json_folder_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/twohands_test_out15"):
+def get_json_folder_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/mp4_outputs_sorted_test4"):
     # json_filename = f"{video_name}_with_speed.json"
     # json_path = os.path.join(base_dir, json_filename)
     # return json_path
@@ -1244,50 +1060,1130 @@ def extract_json_part(text_output):
         return None
 
 
-def get_contact_separation_pairs(results, speed_data):
-    # 构建速度字典
-    speed_dict = {frame: speed for frame, speed in speed_data}
+# def get_contact_separation_pairs(results, speed_data):
+#     # 构建速度字典
+#     speed_dict = {frame: speed for frame, speed in speed_data}
+#
+#     # 分离 Contact 和 Separation 事件，并提取帧和速度
+#     contacts = []
+#     separations = []
+#     for event in results:
+#         event_type, frame = event
+#         if frame not in speed_dict:
+#             continue
+#         if event_type == "Contact":
+#             contacts.append((frame, speed_dict[frame]))
+#         elif event_type == "Separation":
+#             separations.append((frame, speed_dict[frame]))
+#
+#     # 按帧索引排序
+#     contacts.sort()
+#     separations.sort()
+#
+#     pairs = []
+#     contact_candidates = []  # 修正点：存储格式改为 (frame, speed)
+#
+#     # 混合排序所有事件（保持原有逻辑）
+#     all_events = sorted(
+#         [("C", frame, speed) for frame, speed in contacts] +
+#         [("S", frame, speed) for frame, speed in separations],
+#         key=lambda x: x[1]  # 按帧索引排序
+#     )
+#
+#     for event in all_events:
+#         event_type, frame, speed = event
+#
+#         if event_type == "C":
+#             # 修正点：使用 speed 比较（索引应为 1）
+#             if not contact_candidates or speed < contact_candidates[-1][1]:
+#                 contact_candidates.append((frame, speed))
+#
+#         elif event_type == "S":
+#             if contact_candidates:
+#                 # 选择速度最小的 Contact（索引应为 1）
+#                 best_contact = min(contact_candidates, key=lambda x: x[1])
+#                 pairs.append((best_contact[0], frame))
+#                 contact_candidates = []
+#
+#     return pairs
+#加上了打印日志，同时增加权重问题
+# def get_contact_separation_pairs(
+#     results,
+#     speed_data,
+#     *,
+#     min_gap=2,
+#     max_gap=60,
+#     w_time=0.6,
+#     w_speed=0.4,
+#     speed_norm=None,
+#     verbose=True,
+# ):
+#     """
+#     改进版 Contact-Separation 配对：
+#     1) Contact 必须在 Separation 之前
+#     2) 在时间窗内，选「离 Separation 最近 + 速度低」的 Contact
+#     3) Contact 只用一次，避免误配
+#     """
+#
+#     # -----------------------------
+#     # 0. 准备
+#     # -----------------------------
+#     speed_dict = {f: s for f, s in speed_data}
+#
+#     contacts = []
+#     separations = []
+#
+#     for etype, frame in results:
+#         if frame not in speed_dict:
+#             continue
+#         if etype == "Contact":
+#             contacts.append((frame, speed_dict[frame]))
+#         elif etype == "Separation":
+#             separations.append((frame, speed_dict[frame]))
+#
+#     contacts.sort()
+#     separations.sort()
+#
+#     if not contacts or not separations:
+#         if verbose:
+#             print("[PAIR] No valid contacts or separations.")
+#         return []
+#
+#     if speed_norm is None:
+#         speed_norm = max(s for _, s in contacts) + 1e-6
+#
+#     if verbose:
+#         print("\n[CONTACTS]")
+#         for f, v in contacts:
+#             print(f"  frame={f}, speed={v:.6f}")
+#
+#         print("\n[SEPARATIONS]")
+#         for f, v in separations:
+#             print(f"  frame={f}, speed={v:.6f}")
+#
+#     # -----------------------------
+#     # 1. 主匹配循环
+#     # -----------------------------
+#     used_contacts = set()
+#     pairs = []
+#
+#     for sep_frame, sep_speed in separations:
+#
+#         candidates = []
+#
+#         for c_frame, c_speed in contacts:
+#             if c_frame >= sep_frame:
+#                 continue
+#             if c_frame in used_contacts:
+#                 continue
+#
+#             dt = sep_frame - c_frame
+#             if dt < min_gap or dt > max_gap:
+#                 continue
+#
+#             # --------- 加权评分 ----------
+#             score_time = dt / max_gap
+#             score_speed = c_speed / speed_norm
+#             score = w_time * score_time + w_speed * score_speed
+#
+#             candidates.append({
+#                 "c_frame": c_frame,
+#                 "c_speed": c_speed,
+#                 "dt": dt,
+#                 "score": score
+#             })
+#
+#         if not candidates:
+#             if verbose:
+#                 print(f"\n[SKIP] Separation @{sep_frame}: no valid Contact in window")
+#             continue
+#
+#         # 选 score 最小
+#         best = min(candidates, key=lambda x: x["score"])
+#
+#         used_contacts.add(best["c_frame"])
+#         pairs.append((best["c_frame"], sep_frame))
+#
+#         if verbose:
+#             print(
+#                 f"\n[PAIR] Separation @{sep_frame} matched with "
+#                 f"Contact @{best['c_frame']} | "
+#                 f"dt={best['dt']} "
+#                 f"speed={best['c_speed']:.6f} "
+#                 f"score={best['score']:.4f}"
+#             )
+#
+#     if verbose:
+#         print("\n[FINAL PAIRS]")
+#         for c, s in pairs:
+#             print(f"  ({c}, {s})")
+#
+#     return pairs
+import math
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict
 
-    # 分离 Contact 和 Separation 事件，并提取帧和速度
-    contacts = []
-    separations = []
-    for event in results:
-        event_type, frame = event
-        if frame not in speed_dict:
+import numpy as np
+import cv2
+from PIL import Image
+
+
+# ----------------------------
+# Small utils
+# ----------------------------
+def _layout_rc(n: int) -> Tuple[int, int]:
+    """tight grid layout close to square"""
+    if n <= 0:
+        return 1, 1
+    cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+    return rows, cols
+
+
+def _parse_choice_number(text: str) -> Optional[int]:
+    """Parse output like '3' or 'C3' or 'S2' -> returns integer index (1-based)."""
+    if text is None:
+        return None
+    s = str(text).strip().upper()
+    if s == "NONE":
+        return None
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _read_frame_bgr(cap: cv2.VideoCapture, idx: int, fallback_shape=None) -> np.ndarray:
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+    ok, frame = cap.read()
+    if ok and frame is not None:
+        return frame
+    if fallback_shape is None:
+        return np.zeros((240, 320, 3), dtype=np.uint8)
+    return np.zeros(fallback_shape, dtype=np.uint8)
+
+
+def _resize_keep_w(img: np.ndarray, w: int = 260) -> np.ndarray:
+    h0, w0 = img.shape[:2]
+    if w0 <= 0:
+        return img
+    scale = w / float(w0)
+    h = max(1, int(h0 * scale))
+    return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+
+
+# def _make_referee_grid(
+#     *,
+#     video_path: str,
+#     contact_frames: List[int],
+#     separation_frames: List[int],
+#     fixed_side: str,   # "S" or "C"
+#     fixed_frame: int,
+#     cell_w: int = 260,
+#     debug_save_path: Optional[str] = None,
+# ) -> np.ndarray:
+#     """
+#     Build a labeled grid for VLM:
+#       - If fixed_side == "S": cells are C1..Ck and last cell is S (fixed_frame)
+#       - If fixed_side == "C": cells are S1..Sk and last cell is C (fixed_frame)
+#     """
+#     assert fixed_side in ("S", "C")
+#
+#     if fixed_side == "S":
+#         frames = list(contact_frames) + [fixed_frame]
+#         labels = [f"C{i+1}" for i in range(len(contact_frames))] + ["S"]
+#         highlight_last = True
+#     else:
+#         frames = list(separation_frames) + [fixed_frame]
+#         labels = [f"S{i+1}" for i in range(len(separation_frames))] + ["C"]
+#         highlight_last = True
+#
+#     n = len(frames)
+#     rows, cols = _layout_rc(n)
+#
+#     cap = cv2.VideoCapture(video_path)
+#     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+#     # pre-read first valid for fallback shape
+#     fallback = None
+#     if total_frames > 0:
+#         fallback = _resize_keep_w(_read_frame_bgr(cap, 0), cell_w).shape
+#
+#     tiles = []
+#     for f in frames:
+#         f = int(max(0, min(total_frames - 1, int(f)))) if total_frames > 0 else int(f)
+#         img = _read_frame_bgr(cap, f, fallback_shape=fallback)
+#         img = _resize_keep_w(img, cell_w)
+#         tiles.append(img)
+#     cap.release()
+#
+#     # pad to rows*cols
+#     need = rows * cols
+#     if len(tiles) < need:
+#         black = np.zeros_like(tiles[0])
+#         tiles.extend([black] * (need - len(tiles)))
+#         labels = labels + [""] * (need - len(labels))
+#
+#     th, tw = tiles[0].shape[:2]
+#     grid = np.zeros((rows * th, cols * tw, 3), dtype=np.uint8)
+#
+#     for i in range(rows):
+#         for j in range(cols):
+#             k = i * cols + j
+#             tile = tiles[k]
+#             y1, y2 = i * th, (i + 1) * th
+#             x1, x2 = j * tw, (j + 1) * tw
+#             grid[y1:y2, x1:x2] = tile
+#
+#             lab = labels[k]
+#             if lab:
+#                 # label background
+#                 cv2.rectangle(grid, (x1, y1), (x1 + 90, y1 + 35), (255, 255, 255), -1)
+#                 cv2.putText(grid, lab, (x1 + 8, y1 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+#
+#             # highlight fixed frame (last real cell index n-1)
+#             if highlight_last and (k == n - 1):
+#                 cv2.rectangle(grid, (x1 + 2, y1 + 2), (x2 - 2, y2 - 2), (0, 0, 255), 4)
+#
+#     if debug_save_path:
+#         p = Path(debug_save_path)
+#         p.parent.mkdir(parents=True, exist_ok=True)
+#         rgb = cv2.cvtColor(grid, cv2.COLOR_BGR2RGB)
+#         Image.fromarray(rgb).save(str(p))
+#
+#     return grid
+def _make_referee_grid(
+    *,
+    video_path: str,
+    contact_frames: List[int],
+    separation_frames: List[int],
+    fixed_side: str,   # "S" or "C"
+    fixed_frame: int,
+    cell_w: int = 260,
+    debug_save_path: Optional[str] = None,
+    sort_by_distance: bool = False,   # NEW: optional
+) -> np.ndarray:
+    """
+    Build a labeled grid for VLM:
+      - fixed_side == "S": cells are C1..Ck and last cell is S (fixed_frame)
+      - fixed_side == "C": cells are S1..Sk and last cell is C (fixed_frame)
+
+    Enhancements:
+      - show frame index in each cell label (e.g., C3@001234)
+      - mark fixed cell as FIXED explicitly
+      - robust handling if video cannot be opened / no frames
+      - dynamic label background width
+    """
+    assert fixed_side in ("S", "C")
+
+    # ---- build frames + labels (without frame index yet) ----
+    if fixed_side == "S":
+        cand_frames = list(contact_frames)
+        cand_labels = [f"C{i+1}" for i in range(len(cand_frames))]
+        fixed_label = "S"
+    else:
+        cand_frames = list(separation_frames)
+        cand_labels = [f"S{i+1}" for i in range(len(cand_frames))]
+        fixed_label = "C"
+
+    # optional: reorder candidates by distance to fixed_frame for VLM stability
+    if sort_by_distance and len(cand_frames) > 1:
+        order = sorted(range(len(cand_frames)), key=lambda i: abs(int(cand_frames[i]) - int(fixed_frame)))
+        cand_frames = [cand_frames[i] for i in order]
+        cand_labels = [cand_labels[i] for i in order]
+
+    frames = cand_frames + [fixed_frame]
+    labels = cand_labels + [fixed_label]
+    n = len(frames)
+
+    rows, cols = _layout_rc(n)
+
+    # ---- open video ----
+    cap = cv2.VideoCapture(video_path)
+    opened = cap.isOpened()
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if opened else 0
+
+    # fallback shape: try reading frame 0
+    fallback_shape = None
+    if opened and total_frames > 0:
+        fr0 = _read_frame_bgr(cap, 0)
+        if fr0 is not None:
+            fr0r = _resize_keep_w(fr0, cell_w)
+            fallback_shape = fr0r.shape
+
+    # helper to create a black tile if needed
+    def _black_tile():
+        if fallback_shape is not None:
+            return np.zeros(fallback_shape, dtype=np.uint8)
+        # last resort
+        return np.zeros((int(cell_w * 9 / 16), cell_w, 3), dtype=np.uint8)
+
+    tiles = []
+    norm_frames = []
+    for f in frames:
+        if opened and total_frames > 0:
+            ff = int(max(0, min(total_frames - 1, int(f))))
+        else:
+            ff = int(f)
+        norm_frames.append(ff)
+
+        if not opened:
+            img = None
+        else:
+            img = _read_frame_bgr(cap, ff, fallback_shape=fallback_shape)
+
+        if img is None:
+            tile = _black_tile()
+        else:
+            tile = _resize_keep_w(img, cell_w)
+
+        tiles.append(tile)
+
+    if opened:
+        cap.release()
+
+    # ---- pad to rows*cols ----
+    need = rows * cols
+    if len(tiles) < need:
+        tiles.extend([_black_tile()] * (need - len(tiles)))
+        labels = labels + [""] * (need - len(labels))
+        norm_frames = norm_frames + [None] * (need - len(norm_frames))
+
+    th, tw = tiles[0].shape[:2]
+    grid = np.zeros((rows * th, cols * tw, 3), dtype=np.uint8)
+
+    # ---- draw ----
+    for i in range(rows):
+        for j in range(cols):
+            k = i * cols + j
+            tile = tiles[k]
+            y1, y2 = i * th, (i + 1) * th
+            x1, x2 = j * tw, (j + 1) * tw
+            grid[y1:y2, x1:x2] = tile
+
+            lab = labels[k]
+            ff = norm_frames[k]
+
+            if lab:
+                # compose label with frame index
+                if ff is not None:
+                    text = f"{lab}@{int(ff):06d}"
+                else:
+                    text = f"{lab}"
+
+                # mark fixed cell explicitly
+                if k == n - 1:
+                    text = f"{text} FIXED"
+
+                # dynamic background size
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = 0.65
+                thickness = 2
+                (w, h), _ = cv2.getTextSize(text, font, scale, thickness)
+                pad_x, pad_y = 8, 6
+                bg_w = min(tw - 4, w + 2 * pad_x)
+                bg_h = h + 2 * pad_y
+
+                cv2.rectangle(
+                    grid,
+                    (x1 + 2, y1 + 2),
+                    (x1 + 2 + bg_w, y1 + 2 + bg_h),
+                    (255, 255, 255),
+                    -1,
+                )
+                cv2.putText(
+                    grid,
+                    text,
+                    (x1 + 2 + pad_x, y1 + 2 + pad_y + h),
+                    font,
+                    scale,
+                    (0, 0, 0),
+                    thickness,
+                    cv2.LINE_AA,
+                )
+
+            # highlight fixed frame (last real cell index n-1)
+            if k == n - 1:
+                cv2.rectangle(grid, (x1 + 2, y1 + 2), (x2 - 2, y2 - 2), (0, 0, 255), 4)
+
+    if debug_save_path:
+        p = Path(debug_save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        rgb = cv2.cvtColor(grid, cv2.COLOR_BGR2RGB)
+        Image.fromarray(rgb).save(str(p))
+
+    return grid
+
+
+
+def _vlm_choose_one(
+    *,
+    credentials,
+    grid_bgr: np.ndarray,
+    prompt: str,
+) -> Optional[int]:
+    """
+    Returns:
+      - chosen index (1-based) OR None (for NONE/invalid)
+    NOTE: we call scene_understanding with principle="feedback" so it returns raw string.
+    """
+    ans_text = scene_understanding(credentials, grid_bgr, prompt, principle="feedback")
+    if ans_text is None:
+        return None
+    return _parse_choice_number(ans_text)
+
+
+def _fallback_choose_closest(
+    *,
+    fixed_side: str,  # "S" or "C"
+    fixed_frame: int,
+    candidates: List[int],
+) -> Optional[int]:
+    if not candidates:
+        return None
+    # choose minimal temporal distance to fixed_frame (best local heuristic)
+    cand = min(candidates, key=lambda x: abs(int(x) - int(fixed_frame)))
+    return int(cand)
+
+
+# ----------------------------
+# Referee prompts
+# ----------------------------
+PROMPT_S_FIXED = """
+You will see a grid of frames.
+
+- The FIXED frame is the SEPARATION frame labeled S (same episode target).
+- The candidate frames are CONTACT frames labeled C1, C2, C3, ...
+
+Task:
+Choose the ONE contact candidate that belongs to the SAME interaction episode as S.
+If none match, output NONE.
+
+Rules:
+1) Temporal: a valid Contact MUST occur BEFORE S in time.
+2) Episode consistency: Match based on the same object, consistent hand-object relation, and the same ongoing action.
+3) Distance consistency (important):
+   - The matched Contact should typically show the hand touching or VERY CLOSE to the object,
+     because S is a separation moment from that same interaction.
+   - Do NOT choose a contact candidate where the hand is clearly far away from the object;
+     that likely belongs to a different episode.
+   - Exception: if motion clearly indicates a fast throw / rapid pull-away, larger distance changes may be acceptable.
+4) Ignore tiny jitters, brief accidental touches, occlusion artifacts, or unrelated contacts.
+
+Output format (STRICT):
+- Output ONE token only: either a single integer (1,2,3,...) or NONE.
+- Do NOT output any other words.
+""".strip()
+
+PROMPT_C_FIXED = """
+You will see a grid of frames.
+
+- The FIXED frame is the CONTACT frame labeled C (same episode target).
+- The candidate frames are SEPARATION frames labeled S1, S2, S3, ...
+
+Task:
+Choose the ONE separation candidate that belongs to the SAME interaction episode as C.
+If none match, output NONE.
+
+Rules:
+1) Temporal: a valid Separation MUST occur AFTER C in time.
+2) Episode consistency: Match based on the same object, consistent hand-object relation, and the same ongoing action.
+3) Distance consistency (important):
+   - The matched Separation should look like a REAL release: hand and object go from touching/very close
+     to a small visible gap (just separated), not instantly to very far.
+   - Prefer candidates where the hand is still near the object right after release.
+   - Exception: if motion clearly indicates a fast throw / rapid pull-away, a larger distance may be acceptable.
+4) Ignore tiny releases that are not actual separation (e.g., brief slack, occlusion).
+
+Output format (STRICT):
+- Output ONE token only: either a single integer (1,2,3,...) or NONE.
+- Do NOT output any other words.
+""".strip()
+
+
+
+# ----------------------------
+# Main: level-3 pairing with iterative conflict resolution
+# ----------------------------
+def level3_pairing(
+    *,
+    results: List[Tuple[str, int]],
+    video_path: str,
+    credentials,
+    speed_data: Optional[List[Tuple[int, float]]] = None,   # NEW
+    matching_cfg: Optional[dict] = None,                    # NEW
+    max_candidates_per_query: int = 12,
+    max_rounds: int = 3,
+    debug_dir: Optional[Path] = None,
+) -> List[Tuple[int, int]]:
+
+    """
+    Level-3 pairing:
+      1) initial: for each Separation, VLM chooses Contact (or NONE)
+      2) iterative conflicts:
+         - Contact matched multiple times -> for that Contact, VLM selects ONE Separation among conflicts
+         - Separation matched multiple times -> for that Separation, VLM selects ONE Contact among conflicts
+      3) iterate until stable or max_rounds
+      4) final enforce one-to-one
+
+    Returns:
+      pairs: [(contact_frame, separation_frame), ...]
+    """
+
+    # ---- collect events ----
+    contacts = sorted({int(f) for t, f in results if t == "Contact" and isinstance(f, int)})
+    separations = sorted({int(f) for t, f in results if t == "Separation" and isinstance(f, int)})
+
+    print("\n[Level-3] Raw Contacts:", contacts)
+    print("[Level-3] Raw Separations:", separations)
+    if not contacts or not separations:
+        return []
+
+    if debug_dir is not None:
+        debug_dir = Path(debug_dir)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- helper: downsample candidates (keep closest + uniform) ----
+    def _downsample(cands: List[int], center: int, limit: int) -> List[int]:
+        cands = sorted(set(int(x) for x in cands))
+        if len(cands) <= limit:
+            return cands
+        half = max(1, limit // 2)
+        closest = sorted(cands, key=lambda x: abs(x - center))[:half]
+        remain = [x for x in cands if x not in set(closest)]
+        if not remain:
+            return sorted(set(closest))[:limit]
+        step = max(1, len(remain) // max(1, (limit - len(closest))))
+        uniform = remain[::step][: (limit - len(closest))]
+        return sorted(set(closest + uniform))[:limit]
+
+    from collections import defaultdict
+
+    pair_meta = defaultdict(lambda: {"picked": 0, "src": set()})
+    # picked: 被 VLM 选中的次数（越多越可信）
+    # src: 这条边来自哪个阶段：{"init", "confC", "confS"} 便于调试
+
+    # ---- step 1: initial pairing (each S picks one C) ----
+    pairs: List[Tuple[int, int]] = []
+    for s in separations:
+        cands = [c for c in contacts if c < s]
+        if not cands:
             continue
-        if event_type == "Contact":
-            contacts.append((frame, speed_dict[frame]))
-        elif event_type == "Separation":
-            separations.append((frame, speed_dict[frame]))
+        show_cs = _downsample(cands, center=s, limit=max_candidates_per_query)
 
-    # 按帧索引排序
-    contacts.sort()
-    separations.sort()
+        dbg = None
+        if debug_dir is not None:
+            dbg = str(debug_dir / f"init_S{s}.png")
 
-    pairs = []
-    contact_candidates = []  # 修正点：存储格式改为 (frame, speed)
+        grid = _make_referee_grid(
+            video_path=video_path,
+            contact_frames=show_cs,
+            separation_frames=[],
+            fixed_side="S",
+            fixed_frame=s,
+            debug_save_path=dbg
+        )
+        k = _vlm_choose_one(credentials=credentials, grid_bgr=grid, prompt=PROMPT_S_FIXED)
+        if k is None:
+            continue
 
-    # 混合排序所有事件（保持原有逻辑）
-    all_events = sorted(
-        [("C", frame, speed) for frame, speed in contacts] +
-        [("S", frame, speed) for frame, speed in separations],
-        key=lambda x: x[1]  # 按帧索引排序
+        # k refers to Ck (1-based)
+        idx = k - 1
+        if 0 <= idx < len(show_cs):
+            c_chosen = int(show_cs[idx])
+            s_int = int(s)
+            pairs.append((c_chosen, s_int))
+            pair_meta[(c_chosen, s_int)]["picked"] += 1
+            pair_meta[(c_chosen, s_int)]["src"].add("init")
+
+    if not pairs:
+        print("[Level-3] No initial pairs.")
+        return []
+
+    # ---- conflict finder ----
+    def _find_conflicts(pairs_: List[Tuple[int, int]]):
+        c2s = defaultdict(list)
+        s2c = defaultdict(list)
+        for c, s in pairs_:
+            c2s[int(c)].append(int(s))
+            s2c[int(s)].append(int(c))
+        contact_conf = {c: ss for c, ss in c2s.items() if len(ss) > 1}
+        sep_conf = {s: cs for s, cs in s2c.items() if len(cs) > 1}
+        print(f"[L3 CONFLICT] contact_conflicts={contact_conf}")
+        print(f"[L3 CONFLICT] separation_conflicts={sep_conf}")
+
+        return contact_conf, sep_conf
+
+    # ---- resolve conflicts iteratively ----
+    for rd in range(max_rounds):
+        contact_conf, sep_conf = _find_conflicts(pairs)
+
+        print(f"\n[Iter {rd}] pairs={len(pairs)} contact_conf={len(contact_conf)} sep_conf={len(sep_conf)}")
+
+        if not contact_conf and not sep_conf:
+            print("[Iter] stable, stop.")
+            break
+
+        changed = False
+
+        # -------------------------
+        # Phase A: resolve Contact conflicts (C matched to many S)
+        # fixed C -> choose ONE S
+        # -------------------------
+        if contact_conf:
+            new_pairs = []
+            drop_keys = set(contact_conf.keys())
+
+            # keep non-conflict pairs
+            for c, s in pairs:
+                if c not in drop_keys:
+                    new_pairs.append((c, s))
+
+            # solve each conflict group
+            for c, ss in contact_conf.items():
+                # only keep separations after contact
+                ss = [s for s in ss if int(s) > int(c)]
+                if not ss:
+                    continue
+
+                show_ss = _downsample(ss, center=c, limit=max_candidates_per_query)
+
+                dbg = None
+                if debug_dir is not None:
+                    dbg = str(debug_dir / f"confC_C{c}.png")
+
+                grid = _make_referee_grid(
+                    video_path=video_path,
+                    contact_frames=[],
+                    separation_frames=show_ss,
+                    fixed_side="C",
+                    fixed_frame=c,
+                    debug_save_path=dbg
+                )
+                k = _vlm_choose_one(credentials=credentials, grid_bgr=grid, prompt=PROMPT_C_FIXED)
+
+                if k is None:
+                    chosen = _fallback_choose_closest(fixed_side="C", fixed_frame=c, candidates=show_ss)
+                else:
+                    idx = k - 1
+                    chosen = show_ss[idx] if 0 <= idx < len(show_ss) else None
+
+                if chosen is not None:
+                    c_int = int(c)
+                    s_chosen = int(chosen)
+                    new_pairs.append((c_int, s_chosen))
+                    pair_meta[(c_int, s_chosen)]["picked"] += 1
+                    pair_meta[(c_int, s_chosen)]["src"].add("confC")
+                    changed = True
+
+            pairs = new_pairs
+
+        # recompute after phase A
+        contact_conf, sep_conf = _find_conflicts(pairs)
+
+        # -------------------------
+        # Phase B: resolve Separation conflicts (S matched to many C)
+        # fixed S -> choose ONE C
+        # -------------------------
+        if sep_conf:
+            new_pairs = []
+            drop_keys = set(sep_conf.keys())
+
+            # keep non-conflict pairs
+            for c, s in pairs:
+                if s not in drop_keys:
+                    new_pairs.append((c, s))
+
+            for s, cs in sep_conf.items():
+                # only keep contacts before separation
+                cs = [c for c in cs if int(c) < int(s)]
+                if not cs:
+                    continue
+
+                show_cs = _downsample(cs, center=s, limit=max_candidates_per_query)
+
+                dbg = None
+                if debug_dir is not None:
+                    dbg = str(debug_dir / f"confS_S{s}.png")
+
+                grid = _make_referee_grid(
+                    video_path=video_path,
+                    contact_frames=show_cs,
+                    separation_frames=[],
+                    fixed_side="S",
+                    fixed_frame=s,
+                    debug_save_path=dbg
+                )
+                k = _vlm_choose_one(credentials=credentials, grid_bgr=grid, prompt=PROMPT_S_FIXED)
+
+                if k is None:
+                    chosen = _fallback_choose_closest(fixed_side="S", fixed_frame=s, candidates=show_cs)
+                else:
+                    idx = k - 1
+                    chosen = show_cs[idx] if 0 <= idx < len(show_cs) else None
+
+                if chosen is not None:
+                    c_chosen = int(chosen)
+                    s_int = int(s)
+                    new_pairs.append((c_chosen, s_int))
+                    pair_meta[(c_chosen, s_int)]["picked"] += 1
+                    pair_meta[(c_chosen, s_int)]["src"].add("confS")
+                    changed = True
+
+            pairs = new_pairs
+
+        if not changed:
+            print("[Iter] no change in this round, stop.")
+            break
+    speed_dict = None
+    if speed_data:
+        speed_dict = {int(f): float(v) for f, v in speed_data if np.isfinite(v)}
+
+    def speed_score_fn(c, s):
+        vc = speed_dict.get(c, 1e6)
+        vs = speed_dict.get(s, 1e6)
+        return 0.5 * vc + 0.5 * vs
+
+    # ---- final enforce one-to-one (global optimal matching) ----
+    # 可选：如果你有速度函数，就传进去；没有就 None
+    matching_cfg = matching_cfg or {}
+    final_pairs = _final_one_to_one_by_matching(
+        pairs,
+        pair_meta=pair_meta,
+        W=matching_cfg.get("W", 300),
+        penalty=matching_cfg.get("penalty", 1000.0),
+        w_dt=matching_cfg.get("w_dt", 1.0),
+        w_window=matching_cfg.get("w_window", 1.0),
+        w_vlm=matching_cfg.get("w_vlm", -120.0),
+        speed_score_fn=speed_score_fn,  # ✅ now enabled
+        w_speed=matching_cfg.get("w_speed", 1.0),  # ✅ tune here
     )
 
-    for event in all_events:
-        event_type, frame, speed = event
+    print("\n[Level-3] Final pairs:", final_pairs)
+    return final_pairs
 
-        if event_type == "C":
-            # 修正点：使用 speed 比较（索引应为 1）
-            if not contact_candidates or speed < contact_candidates[-1][1]:
-                contact_candidates.append((frame, speed))
 
-        elif event_type == "S":
-            if contact_candidates:
-                # 选择速度最小的 Contact（索引应为 1）
-                best_contact = min(contact_candidates, key=lambda x: x[1])
-                pairs.append((best_contact[0], frame))
-                contact_candidates = []
+def speed_score_fn(c, s):
+    # 举例：假设你有 dict: sep_to_min_frame[s] = frame_min
+    m = sep_to_min_frame.get(s)
+    if m is None:
+        return 0.0
+    return abs(c - m) * 0.1  # 权重0.1只是示例
+def _hungarian_min_cost(cost):
+    """
+    Hungarian algorithm for rectangular matrices (min-cost assignment).
+    cost: list[list[float]] shape (n, m)
+    returns: assignment list a where a[i] = j matched column for row i, or -1
+    """
+    n = len(cost)
+    m = len(cost[0]) if n else 0
+
+    transposed = False
+    if n > m:
+        transposed = True
+        cost = [list(row) for row in zip(*cost)]
+        n, m = m, n
+
+    u = [0.0] * (n + 1)
+    v = [0.0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float("inf")] * (m + 1)
+        used = [False] * (m + 1)
+
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = float("inf")
+            j1 = 0
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    assignment = [-1] * n
+    for j in range(1, m + 1):
+        if p[j] != 0:
+            assignment[p[j] - 1] = j - 1
+
+    if transposed:
+        # convert back: original rows assignment
+        orig_n = m  # original rows
+        inv = [-1] * orig_n
+        for r, c in enumerate(assignment):
+            if c != -1:
+                inv[c] = r
+        return inv
+
+    return assignment
+def _final_one_to_one_by_matching(
+    pairs,
+    pair_meta=None,
+    *,
+    W=300,                # 时间窗（帧数）：例如 300帧 ≈ 10s@30fps
+    penalty=1000.0,       # 超窗惩罚：要大于典型 |s-c|
+    w_dt=1.0,             # |s-c| 权重
+    w_window=1.0,         # 超窗惩罚权重
+    w_vlm=-120.0,         # VLM偏好权重（负号：picked越多 cost越低）
+    speed_score_fn=None,  # 可选：额外成本函数 speed_score_fn(c,s)->float
+    w_speed=1.0,          # speed项权重
+    forbid_inf=1e12,      # 禁止边的超大成本
+):
+    """
+    pairs: list[(c, s)] candidate edges
+    pair_meta: dict[(c,s)] -> {"picked": int, "src": set()}
+    returns: list[(c, s)] one-to-one set minimizing total cost.
+    """
+    pairs = sorted(set((int(c), int(s)) for c, s in pairs))
+    if not pairs:
+        return []
+
+    pair_meta = pair_meta or {}
+
+    Cs = sorted({c for c, _ in pairs})
+    Ss = sorted({s for _, s in pairs})
+    ci = {c: i for i, c in enumerate(Cs)}
+    sj = {s: j for j, s in enumerate(Ss)}
+
+    INF = float(forbid_inf)
+    cost = [[INF] * len(Ss) for _ in range(len(Cs))]
+
+    # Fill costs only for allowed edges present in pairs
+    for c, s in pairs:
+        dt = abs(s - c)
+        window_cost = 0.0
+        if dt > W:
+            window_cost = penalty + (dt - W) * 0.1  # 超窗后随距离略增（可调）
+
+        picked = 0
+        meta = pair_meta.get((c, s))
+        if meta is not None:
+            picked = int(meta.get("picked", 0))
+
+        vlm_bonus_cost = w_vlm * picked  # picked越大，cost越低（因为w_vlm为负）
+
+        speed_cost = 0.0
+        if speed_score_fn is not None:
+            try:
+                speed_cost = float(speed_score_fn(c, s))
+            except Exception:
+                speed_cost = 0.0
+
+        total_cost = (
+            w_dt * dt
+            + w_window * window_cost
+            + vlm_bonus_cost
+            + w_speed * speed_cost
+        )
+
+        cost[ci[c]][sj[s]] = total_cost
+
+    assign = _hungarian_min_cost(cost)
+
+    final_pairs = []
+    for i, j in enumerate(assign):
+        if j == -1:
+            continue
+        if cost[i][j] >= INF / 2:
+            continue
+        final_pairs.append((Cs[i], Ss[j]))
+
+    final_pairs.sort(key=lambda x: (x[1], x[0]))
+    return final_pairs
+
+def vlm_referee_all_contacts_for_separation(
+    *,
+    credentials,
+    video_path: str,
+    contact_frames: list,
+    separation_frame: int,
+    max_contacts: int = 12,
+    principle: str = "referee_all",
+    debug_save_path: str = None,
+):
+    """
+    Given many Contact frames and one Separation frame,
+    ask VLM to choose which Contact matches this Separation, or NONE.
+    """
+
+    # -------- sanity --------
+    contacts_before = sorted(
+        {c for c in contact_frames if isinstance(c, int) and c < separation_frame}
+    )
+    if not contacts_before:
+        return None
+
+    # -------- downsample if needed --------
+    if len(contacts_before) > max_contacts:
+        closest = sorted(
+            contacts_before,
+            key=lambda x: abs(separation_frame - x)
+        )[: max_contacts // 2]
+
+        remain = [c for c in contacts_before if c not in set(closest)]
+        step = max(1, len(remain) // max(1, (max_contacts - len(closest))))
+        uniform = remain[::step][: (max_contacts - len(closest))]
+
+        contacts_show = sorted(set(closest + uniform))
+    else:
+        contacts_show = contacts_before
+
+    # -------- build grid: C1..Ck + S --------
+    frames = contacts_show + [separation_frame]
+    minima_index = len(frames) - 1  # highlight S
+
+    grid_bgr = create_frame_grid_with_keyframe(
+        video_path,
+        frames,
+        grid_size=len(frames),
+
+    )
+
+    if debug_save_path:
+        import cv2
+        from PIL import Image
+        rgb = cv2.cvtColor(grid_bgr, cv2.COLOR_BGR2RGB)
+        from pathlib import Path
+
+        debug_dir = Path("/home/EgoLoc/debug_referee")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        debug_save_path = debug_dir / f"referee_S{separation_frame}.png"
+        Image.fromarray(rgb).save(debug_save_path)
+
+        Image.fromarray(rgb).save(debug_save_path)
+
+    # -------- prompt --------
+    prompt = """
+You will see a grid of frames.
+Some frames are CONTACT candidates labeled C1, C2, C3, ...
+The last frame is the SEPARATION frame labeled S.
+
+Task:
+Choose which CONTACT belongs to the SAME interaction episode as S.
+If none match, output NONE.
+
+Rules:
+- Contact must occur before S
+- Match based on same object and consistent interaction
+- Ignore tiny hand jitters or unrelated touches
+
+Output format (ONE token only):
+- number (1,2,3,...) or NONE
+"""
+
+    # -------- VLM call --------
+    answer = scene_understanding(
+        credentials,
+        grid_bgr,
+        prompt,
+        principle=principle
+    )
+
+    print(f"[VLM referee] S={separation_frame} → {answer}")
+
+    if not answer:
+        return None
+
+    ans = str(answer).strip().upper()
+    if ans == "NONE":
+        return None
+
+    import re
+    m = re.search(r"(\d+)", ans)
+    if not m:
+        return None
+
+    idx = int(m.group(1)) - 1
+    if 0 <= idx < len(contacts_show):
+        return contacts_show[idx]
+
+    return None
+
+def get_contact_separation_pairs(
+    *,
+    results,
+    video_path,
+    credentials,
+    max_contacts_per_query=12,
+    debug_dir=None,
+):
+    """
+    Level-3: VLM-only pairing.
+    For each Separation, ask VLM to choose the best Contact or NONE.
+
+    Args:
+        results: [(event_type, frame_idx), ...]
+        video_path: path to video
+        credentials: VLM credentials
+        max_contacts_per_query: limit contacts shown to VLM
+        debug_dir: optional Path to save referee grids
+
+    Returns:
+        pairs: [(contact_frame, separation_frame), ...]
+    """
+
+    # ----------------------------
+    # 1) Collect raw events
+    # ----------------------------
+    contacts = sorted({f for t, f in results if t == "Contact"})
+    separations = sorted({f for t, f in results if t == "Separation"})
+
+    print("\n[Level-3] Raw Contacts:", contacts)
+    print("[Level-3] Raw Separations:", separations)
+
+    if not contacts or not separations:
+        return []
+
+    pairs = []
+
+    # ----------------------------
+    # 2) For each Separation → VLM chooses Contact
+    # ----------------------------
+    for s in separations:
+        c = vlm_referee_all_contacts_for_separation(
+            credentials=credentials,
+            video_path=video_path,
+            contact_frames=contacts,
+            separation_frame=s,
+            max_contacts=max_contacts_per_query,
+            debug_save_path=(
+                str(debug_dir / f"referee_S{s}.png")
+                if debug_dir is not None else None
+            ),
+        )
+
+        if c is not None:
+            pairs.append((c, s))
+            print(f"[PAIR] Contact {c}  →  Separation {s}")
+        else:
+            print(f"[PAIR] Separation {s}: NONE")
 
     return pairs
 
@@ -1371,6 +2267,9 @@ def scene_understanding(credentials, frame, prompt_message, principle=None):
         # print("answer:",result.choices[0].message.content)
         state = extract_event_info(result.choices[0].message.content)
         return state
+    if principle == "state_score":
+        # 返回原始文本，交给 parse_state_scores
+        return result.choices[0].message.content
     elif principle == "feedback":
         # print("feedback:",result.choices[0].message.content)
         return result.choices[0].message.content
@@ -1488,128 +2387,7 @@ def image_resize_state(image, width=None):
     return cv2.resize(image, dim, interpolation=cv2.INTER_AREA)
 
 
-# def create_frame_grid_state(video_path, frame_indices):
-#     assert len(frame_indices) == 2, "frame_indices 必须包含两个元素"
-#
-#     video = cv2.VideoCapture(video_path)
-#     frames = []
-#
-#     for index in frame_indices:
-#         video.set(cv2.CAP_PROP_POS_FRAMES, index)
-#         success, frame = video.read()
-#         if success:
-#             frame = image_resize(frame, width=200)
-#         else:
-#             frame = np.zeros((112, 200, 3), dtype=np.uint8)  # 生成黑色填充帧
-#         frames.append(frame)
-#
-#     video.release()
-#     # 确保两帧可用
-#     if len(frames) < 2:
-#         missing_frames = 2 - len(frames)
-#         black_frame = np.zeros_like(frames[0])
-#         frames.extend([black_frame] * missing_frames)
-#
-#     frame_height, frame_width = frames[0].shape[:2]
-#     grid_img = np.ones((frame_height, frame_width * 2, 3), dtype=np.uint8) * 255
-#
-#     # 左侧图像
-#     grid_img[:, :frame_width] = frames[0]
-#     # 右侧图像
-#     grid_img[:, frame_width:] = frames[1]
-#
-#     return grid_img
 
-#起始
-# def create_frame_grid_state(video_path, frame_indices, grid_size=None,hand="hand"):
-#     if grid_size is None:
-#         grid_size = (1, len(frame_indices))
-#     spacer = 0
-#     video = cv2.VideoCapture(video_path)
-#     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-#     frames = []
-#     prev = None  # 这个 grid 内保持一致（左/右手各自可以做 dict，这里先简化成单手）
-#     for idx in frame_indices:
-#         video.set(cv2.CAP_PROP_POS_FRAMES, idx)
-#         success, frame = video.read()
-#         if success:
-#             # 调整尺寸（保持宽度 400）
-#             frame = image_resize(frame, width=400)
-#             # 手部检测并裁剪，再缩放回当前尺寸
-#             # frame = run_groundingdino_and_crop(frame,text_prompt=hand)
-#             frame, prev = run_groundingdino_and_crop_stable(
-#                 frame, hand=hand, mirror=False, prev_box=prev,
-#                 expand_ratio=0.25, box_thresh=0.3
-#             )
-#             debug=True
-#             if debug and prev is not None:
-#                 # 在裁剪前的 frame 上画出 chosen box，方便看是否选对手
-#                 vis = frame.copy()
-#                 x0, y0, x1, y1 = prev
-#                 cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 0), 2)
-#                 cv2.putText(vis, f"{hand} @ frame {idx}", (10, 30),
-#                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-#                 frames.append(vis)
-#             else:
-#                 frames.append(cropped)
-#
-#             frames.append(frame)
-#         else:
-#             print(f"Warning: Frame {idx} not found (total {total_frames}). Using black frame.")
-#             # 使用与前面帧相同尺寸的黑帧
-#             black = np.zeros_like(frames[0] if frames else np.zeros((400, 400, 3), dtype=np.uint8))
-#             frames.append(black)
-#     video.release()
-#
-#     # 如果帧不足，填充黑帧
-#     total_needed = grid_size[0] * grid_size[1]
-#     if len(frames) < total_needed:
-#         missing = total_needed - len(frames)
-#         black = np.zeros_like(frames[0])
-#         frames.extend([black] * missing)
-#
-#     fh, fw = frames[0].shape[:2]
-#     gh = grid_size[0] * fh + (grid_size[0] - 1) * spacer
-#     gw = grid_size[1] * fw + (grid_size[1] - 1) * spacer
-#     grid_img = np.ones((gh, gw, 3), dtype=np.uint8) * 255
-#
-#     for i in range(grid_size[0]):
-#         for j in range(grid_size[1]):
-#             idx = i * grid_size[1] + j
-#             frame = frames[idx]
-#             # 渲染圆与数字
-#             # cX, cY = fw // 2, fh // 2
-#             # max_dim = int(min(fh, fw) * 0.5)
-#             # overlay = frame.copy()
-#             # if render_pos == 'center':
-#             #     center = (cX, cY)
-#             # else:
-#             #     center = (fw - max_dim//2, max_dim//2)
-#             # cv2.circle(overlay, center, max_dim//2, (255,255,255), -1)
-#             # frame = cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
-#             # cv2.circle(frame, center, max_dim//2, (255,255,255), 2)
-#             # # 文本
-#             # text = str(idx+1)
-#             # ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, max_dim/50, 2)[0]
-#             # if render_pos == 'center':
-#             #     tx = cX - ts[0]//2
-#             #     ty = cY + ts[1]//2
-#             # else:
-#             #     tx = fw - ts[0]//2 - max_dim//2
-#             #     ty = ts[1]//2 + max_dim//2
-#             # cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, max_dim/50, (0,0,0), 2)
-#
-#             y1 = i * (fh + spacer)
-#             y2 = y1 + fh
-#             x1 = j * (fw + spacer)
-#             x2 = x1 + fw
-#             grid_img[y1:y2, x1:x2] = frame
-#
-#     return grid_img
-#终止
-import math
-import numpy as np
-import cv2
 
 def create_frame_grid_state(video_path, frame_indices, grid_size=None, hand="hand",
                             debug=False, show="cropped"):
@@ -1727,74 +2505,7 @@ import math
 import numpy as np
 import cv2
 
-# def create_frame_grid_state(
-#         video_path,
-#         frame_indices,
-#         grid_size=None,          # ⭐ None 表示自动布局
-#         hand="hand",
-#         max_cols=4,              # ⭐ 每行最多几张
-#         draw_frame_id=True,      # ⭐ 是否在每张小图上写帧号
-# ):
-#     spacer = 6  # 给一点间隔更好看
-#     video = cv2.VideoCapture(video_path)
-#     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-#
-#     frames = []
-#     for idx in frame_indices:
-#         video.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-#         success, frame = video.read()
-#         if success:
-#             frame = image_resize(frame, width=400)
-#             frame = run_groundingdino_and_crop(frame, hand=hand)
-#
-#             # ⭐ 叠加帧号，方便你肉眼确认是不是裁剪/排序对了
-#             if draw_frame_id:
-#                 cv2.putText(
-#                     frame, f"frame={idx}", (10, 30),
-#                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA
-#                 )
-#             frames.append(frame)
-#         else:
-#             print(f"Warning: Frame {idx} not found (total {total_frames}). Using black frame.")
-#             black = np.zeros_like(frames[0] if frames else np.zeros((400, 400, 3), dtype=np.uint8))
-#             frames.append(black)
-#
-#     video.release()
-#
-#     n = len(frames)
-#     if n == 0:
-#         return np.zeros((400, 400, 3), dtype=np.uint8)
-#
-#     # ⭐ 自动决定 grid 行列
-#     if grid_size is None:
-#         cols = min(max_cols, n)
-#         rows = int(math.ceil(n / cols))
-#     else:
-#         rows, cols = grid_size
-#
-#     fh, fw = frames[0].shape[:2]
-#     gh = rows * fh + (rows - 1) * spacer
-#     gw = cols * fw + (cols - 1) * spacer
-#     grid_img = np.ones((gh, gw, 3), dtype=np.uint8) * 255
-#
-#     # ⭐ 不足补黑帧
-#     total_needed = rows * cols
-#     if n < total_needed:
-#         black = np.zeros_like(frames[0])
-#         frames.extend([black] * (total_needed - n))
-#
-#     # ⭐ 拼接
-#     k = 0
-#     for r in range(rows):
-#         for c in range(cols):
-#             y1 = r * (fh + spacer)
-#             y2 = y1 + fh
-#             x1 = c * (fw + spacer)
-#             x2 = x1 + fw
-#             grid_img[y1:y2, x1:x2] = frames[k]
-#             k += 1
-#
-#     return grid_img
+
 
 
 def add_text_with_background(
@@ -1896,17 +2607,14 @@ def _safe_choice(cands: List[int], probs: Optional[np.ndarray] = None) -> int:
         return int(np.random.choice(cands))
     return int(np.random.choice(cands, p=probs))
 
-# def _build_mapped_window(center: int, window: int, all_frames_np: np.ndarray, total_frames: int) -> List[int]:
-#     """围绕 center±window 生成候选，全部映射到 all_frames 的最近存在帧，并去重排序。"""
-#     raw = list(range(center - window, center + window + 1))
-#     raw = [r for r in raw if 0 <= r < total_frames]
-#     mapped = []
-#     for r in raw:
-#         nf = _nearest_valid_frame(r, all_frames_np, total_frames)
-#         if nf is not None:
-#             mapped.append(nf)
-#     # 去重并排序
-#     return sorted(set(mapped))
+def build_context_frames(center_frame: int, all_frames_np, total_frames: int, ctx_win: int = 2):
+    # ctx_win=2 => [t-2, t-1, t, t+1, t+2]（会映射到最近有效帧）
+    return _build_mapped_window(center_frame, ctx_win, all_frames_np, total_frames)
+#冲突检测
+from collections import defaultdict
+
+
+
 def _build_mapped_window(center: int, window: int, all_frames_np: np.ndarray, total_frames: int) -> List[int]:
     raw = list(range(center - window, center + window + 1))
     raw = [r for r in raw if 0 <= r < total_frames]
@@ -1918,8 +2626,88 @@ def _build_mapped_window(center: int, window: int, all_frames_np: np.ndarray, to
     # 顺序去重：保留靠近 center 的相对顺序
     uniq = list(dict.fromkeys(mapped))
     return uniq
-
+# Event Logic (Left -> Right):
+# - If {contact_event} -> "Event: Contact"
+# - If {sep_event} -> "Event: Separation"
+# - Otherwise -> "Event: Neither"
 # ===== END PATCH: helpers =====
+
+# prompt_state = f"""
+# Instruction:
+#
+# You are given a time-ordered image grid (earlier→later).
+# Determine whether there is a POSSIBLY transition to Contact or to Separation within the grid, and output Event.
+# Definitions (per frame):
+# - {contact_def}
+# - {sep_def}
+#
+# # Event Logic (Left -> Right):
+# # - If {contact_event} -> "Event: Contact"
+# # - If {sep_event} -> "Event: Separation"
+# # - Otherwise -> "Event: Neither"
+#
+#
+#
+# Strict Output Format:
+# Output exactly one line:
+# "Event: Contact" OR "Event: Separation" OR "Event: Neither"
+# """.strip()
+import re
+
+def parse_state_scores(vlm_output: str):
+    """
+    Parse:
+    Contact: 0.73
+    Separation: 0.21
+    """
+    if not isinstance(vlm_output, str):
+        return None, None
+
+    m1 = re.search(r"Contact\s*:\s*([0-9]*\.?[0-9]+)", vlm_output, re.I)
+    m2 = re.search(r"Separation\s*:\s*([0-9]*\.?[0-9]+)", vlm_output, re.I)
+
+    c = float(m1.group(1)) if m1 else None
+    s = float(m2.group(1)) if m2 else None
+    return c, s
+
+
+def decide_state_from_scores(c, s, contact_th=0.35, separation_th=0.35, margin=0.10):
+    """
+    宽进严出：
+    - 只有“明显更像 Contact/Separation”才下硬标签
+    - 否则 Ambiguous，后续交给 feedback / pairing / referee
+    """
+
+
+    if c >= contact_th and c >= s + margin:
+        return "Contact"
+    if s >= separation_th and s >= c + margin:
+        return "Separation"
+    return "Ambiguous"
+#2.6修改prompt，增加transition判断，原版如下
+# prompt_state = f"""
+#     Instruction:
+#     You are given a time-ordered image grid (earlier → later) showing hands and an object.
+#
+#     Your task is NOT to make a hard decision.
+#     Instead, estimate TWO independent confidence scores in [0.0, 1.0]:
+#
+#     Definitions (per frame):
+#     - Contact: {contact_def}
+#     - Separation: {sep_def}
+#
+#     Scoring rules:
+#     - Scores are NOT mutually exclusive.
+#     - It is allowed that both scores are high (ambiguous transition).
+#     - It is allowed that both scores are low (no clear interaction).
+#     - Use the entire grid as temporal context.
+#
+#     Strict Output Format (EXACTLY two lines):
+#     Contact: <float between 0.0 and 1.0>
+#     Separation: <float between 0.0 and 1.0>
+#
+#     Do NOT output any explanation.
+#     """.strip()
 def build_prompts(hand: str = "right"):
     # hand ∈ {"left","right","both","any","min","max","avg"} 你也可以只用前三个
     hand = hand.lower()
@@ -1934,15 +2722,7 @@ def build_prompts(hand: str = "right"):
         who_contact = f"ONLY judge the interaction between {subj} and the object. Ignore the other hand even if it touches."
         sep_rule = f"If the {hand} hand is not touching, it is Separation even if the other hand is touching."
 
-    else:
-        # 双手/任意手模式：Contact=任意手接触；Separation=两手都不接触（更合理的“动作结束”定义）
-        subj = "either hand"
-        contact_def = "Contact means at least ONE hand is in physical contact with the object."
-        sep_def = "Separation means NO hands are in contact with the object (both hands are separate)."
-        contact_event = "Left is Separation (no hands touching) and Right is Contact (at least one hand touching)"
-        sep_event = "Left is Contact (at least one hand touching) and Right is Separation (no hands touching)"
-        who_contact = "Judge using BOTH hands."
-        sep_rule = "If at least one hand is still touching, it is NOT separation."
+
 
     prompt_contact = f"""
 Instruction:
@@ -1983,23 +2763,42 @@ or
 """.strip()
 
     prompt_state = f"""
-Instruction:
+    Instruction:
+    You are given a time-ordered image grid (earlier → later) showing a hand and a target object.
 
-You are given a time-ordered image grid (earlier→later). 
-Determine whether there is a transition to Contact or to Separation within the grid, and output Event.
-Definitions (per frame):
-- {contact_def}
-- {sep_def}
+    Your task is NOT to output a discrete event.
+    Instead, estimate TWO independent confidence scores in [0.0, 1.0]:
 
-Event Logic (Left -> Right):
-- If {contact_event} -> "Event: Contact"
-- If {sep_event} -> "Event: Separation"
-- Otherwise -> "Event: Neither"
+    Definitions:
+    - Contact: {contact_def}
+    - Separation: {sep_def}
 
-Strict Output Format:
-Output exactly one line:
-"Event: Contact" OR "Event: Separation" OR "Event: Neither"
-""".strip()
+    Temporal Reasoning Steps:
+    1. Ensure the same target object is observed across the grid.
+    2. Compare earlier frames with later frames.
+    3. Determine whether there is:
+       - Increasing evidence of physical touch (toward Contact),
+       - Increasing evidence of detachment (toward Separation),
+       - Or no significant interaction change.
+
+    Scoring Interpretation:
+    - Contact score reflects how strongly the grid suggests a transition toward or presence of Contact.
+    - Separation score reflects how strongly the grid suggests a transition toward or presence of Separation.
+    - Scores are NOT mutually exclusive.
+    - Both scores may be high during ambiguous transitions.
+    - Both scores may be low if interaction is unclear or absent.
+
+    Bias Rule (important):
+    - If uncertain but the hand appears to approach or align with the object, lean toward higher Contact score.
+    - If uncertain but the hand appears to move away or clearly open, lean toward higher Separation score.
+    - Avoid assigning high scores to both unless there is clear transitional ambiguity.
+
+    Strict Output Format (EXACTLY two lines):
+    Contact: <float between 0.0 and 1.0>
+    Separation: <float between 0.0 and 1.0>
+
+    Do NOT output explanation.
+    """.strip()
 
     feedback_prompt_contact = f"""
 You will be given ONE image with hands and an object.
@@ -2016,7 +2815,81 @@ Decide whether it is SEPARATION under this rule:
 Answer 1 if yes, else 0. Output only 1 or 0.
 """.strip()
 
-    return prompt_contact, prompt_separation, prompt_state, feedback_prompt_contact, feedback_prompt_separation
+    feedback_score_prompt_contact = f"""
+You will be given ONE image OR a short time-ordered grid around a candidate frame.
+Task: Judge whether the CENTER frame should be considered CONTACT under this rule:
+- {contact_def}
+
+Output MUST be a single-line JSON (no extra text):
+{{"score": 0.0, "label": "contact" or "not_contact", "reason": "short reason"}}
+
+Scoring rubric:
+- 1.0 = definitely contact (clear physical touch)
+- 0.7~0.9 = likely contact
+- 0.4~0.6 = uncertain
+- 0.0~0.3 = definitely not contact
+""".strip()
+
+    feedback_score_prompt_separation = f"""
+You will be given ONE image OR a short time-ordered grid around a candidate frame.
+Task: Judge whether the CENTER frame should be considered SEPARATION under this rule:
+- {sep_def}
+- {sep_rule}
+
+Output MUST be a single-line JSON (no extra text):
+{{"score": 0.0, "label": "separation" or "not_separation", "reason": "short reason"}}
+
+Scoring rubric:
+- 1.0 = definitely separation (clear gap, no touch)
+- 0.7~0.9 = likely separation
+- 0.4~0.6 = uncertain
+- 0.0~0.3 = definitely not separation
+""".strip()
+
+    return (
+        prompt_contact,
+        prompt_separation,
+        prompt_state,
+        feedback_prompt_contact,
+        feedback_prompt_separation,
+        feedback_score_prompt_contact,
+        feedback_score_prompt_separation,
+    )
+def extract_score_info(response: str):
+    """
+    解析 VLM 输出的 JSON:
+    {"score": 0.83, "label": "...", "reason": "..."}
+    允许模型偶尔多输出几句：会从文本中抓第一个 {...} 来尝试 json.loads
+    返回: (score(float|None), label(str|None), reason(str|None))
+    """
+    if response is None:
+        return None, None, None
+
+    text = str(response).strip()
+
+    # 1) 先尝试直接 loads
+    try:
+        obj = json.loads(text)
+        score = float(obj.get("score", None))
+        label = obj.get("label", None)
+        reason = obj.get("reason", None)
+        return score, label, reason
+    except Exception:
+        pass
+
+    # 2) 再从文本里抓一个 JSON 子串（最常见：前后有多余解释）
+    m = re.search(r"\{.*?\}", text, flags=re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            score = float(obj.get("score", None))
+            label = obj.get("label", None)
+            reason = obj.get("reason", None)
+            return score, label, reason
+        except Exception:
+            return None, None, None
+
+    return None, None, None
 
 
 def process_task(
@@ -2029,141 +2902,14 @@ def process_task(
         max_feedback=5,
         video_type="short",
         keyframe_sampling_mode="adaptive",
-        use_feedback=False,
+        use_feedback=True,
         hand="right",      # ⭐ 新增
 ):
     """Process a task to identify the start or end of an action in a video."""
-    #起始
-    # prompt_contact = (
-    #     """
-    #     Instruction:
-    #     You will be given a time-ordered image grid containing a hand and a target object. Your task is to find the earliest contact moment, where the hand first contacts with the object, and return its index.
-    #
-    #     Reasoning Steps:
-    #     1. Analyze each frame to observe the relationship between the hand and the object.
-    #     2. Identify the earliest transition from separation (hand not touching the object) → contact (hand touching the object).
-    #     3. If no contact is detected within the grid, return -1.
-    #
-    #     Strict Output Format:
-    #     If a contact moment is detected:
-    #     "Frame: X"
-    #     (Where X is the index of the earliest contact frame)
-    #     If no contact is detected:
-    #     "Frame: -1"
-    #     """
-    # )
-    #
-    # prompt_separation = (
-    #     """
-    #     Instruction:
-    #     You will be given a time-ordered image grid containing a hand and a target object. Your task is to find the earliest separation moment, where the hand first separates with the object, and return its index.
-    #
-    #     Reasoning Steps:
-    #     1. Analyze each frame to observe the relationship between the hand and the object.
-    #     2. Identify the earliest transition from contact (hand touching the object) → separation (hand moving away from the object).
-    #     3. If no separation is detected within the grid, return -1.
-    #
-    #     Strict Output Format:
-    #     If a separation moment is detected:
-    #     "Frame: X"
-    #     (Where X is the index of the earliest separation frame)
-    #     If no separation is detected:
-    #     "Frame: -1"
-    #     """
-    # )
-    # 终止
-    # prompt_state = (
-    #     """
-    #     Instruction:
-    #     - You will be given two frames: a previous frame (Frame Left) and a next frame (Frame Right). Your goal is to detect whether a Contact Moment, a Separation Moment, or Neither occurs based on the change in hand-object interaction between the two frames.
 
-    #     Definitions:
-    #     - Contact: The hand is touching or making physical contact with the target object.
-    #     - Separation: The hand is not touching the target object.
-
-    #     Steps:
-    #     - Confirm that you are looking at the same target object in both frames.
-    #     - In Frame Left:
-    #         - If the hand is touching the object, classify as Contact.
-    #         - Otherwise, classify as Separation.
-    #     - In Frame Right:
-    #         - If the hand is touching the object, classify as Contact.
-    #         - Otherwise, classify as Separation.
-    #     - Determine the event based on the transition:
-    #         - If Frame Left = Separation → Frame Right = Contact, output: Event: Contact
-    #         - If Frame Left = Contact → Frame Right = Separation, output: Event: Separation
-    #         - For all other combinations (Contact → Contact, Separation → Separation), output: Event: Neither
-
-    #     Output Format (Strict):
-    #     - After completing your reasoning, output exactly one of the following as the final line:
-    #         - "Event: Contact"
-    #         - "Event: Separation"
-    #         - "Event: Neither"
-    #     """
-    # )
-
-    #起始
-    # prompt_state = (
-    #     """
-    #     Instruction:
-    #     - You are given two image frames: a previous frame (Frame Left) and a future frame (Frame Right).
-    #     - Your task is to detect a **Contact Moment** or **Separation Moment** by analyzing the change in interaction between the hand and a target object of the two frames.
-    #     - Avoid outputting "Event: Neither" unless both frames clearly and confidently show the **same state with no visible change**.
-    #
-    #     Definitions:
-    #     - Contact: The hand is visibly touching or making physical contact with the object (e.g., fingers pressed against the surface, grasping).
-    #     - Separation: The hand is clearly not in contact with the object (e.g., fingers hovering, obvious gap, no overlap).
-    #
-    #     Steps:
-    #     1. Ensure the same target object is being observed in both frames.
-    #     2. For each frame:
-    #     - Check whether the hand is **clearly touching** or **clearly not touching** the object.
-    #     - If it’s ambiguous, lean toward detecting **Contact** if the hand is near or aligned for grasp; lean toward **Separation** if the hand is retreating or open.
-    #     3. Decide the event based on the transition:
-    #     - If Frame Left = Separation and Frame Right = Contact → output: **Event: Contact**
-    #     - If Frame Left = Contact and Frame Right = Separation → output: **Event: Separation**
-    #     - If both frames show **no significant change**, and you are confident the contact state stayed the same → output: **Event: Neither**
-    #     - In cases of uncertainty or partial motion, prefer to output **Contact** or **Separation** over “Neither”.
-    #
-    #     Output Format (Strict):
-    #     Output exactly one of the following as the final line:
-    #     - "Event: Contact"
-    #     - "Event: Separation"
-    #     - "Event: Neither"
-    #
-    #     """
-    # )
-    #终止
-
-    # prompt_state = (
-    #     """
-    #     Instruction:
-    #     - You are given two image frames: a previous frame (Frame Left) and a next frame (Frame Right).
-    #     - Your task is to determine whether a **Contact Moment** or a **Separation Moment** occurs, based on the change in interaction between the hand and a target object.
-
-    #     Definitions:
-    #     - Contact: The hand is visibly touching the object (e.g., fingers in contact, object gripped or pressed).
-    #     - Separation: The hand is not in contact with the object (e.g., fingers open or pulled back, a visible gap between hand and object).
-
-    #     Steps:
-    #     1. Ensure the same object is present in both frames.
-    #     2. For each frame, decide whether the hand is in a Contact or Separation state:
-    #     - If unclear or ambiguous, **do not assume “no change”**.
-    #     - Instead, infer the most likely state by considering hand posture, motion direction, and proximity to the object:
-    #         - If the hand is moving toward or very close to the object with grasping posture → classify as Contact.
-    #         - If the hand is withdrawing or open with distance from the object → classify as Separation.
-    #     3. Use the following logic to determine the event:
-    #     - If Frame Left = Separation and Frame Right = Contact → output: **Event: Contact**
-    #     - If Frame Left = Contact and Frame Right = Separation → output: **Event: Separation**
-    #     - If both frames appear to have the same state, but there is any uncertainty or motion → **choose the most likely transition** (Contact or Separation).
-
-    #     Output Format (Strict):
-    #     Output exactly one of the following as the final line:
-    #     - "Event: Contact"
-    #     - "Event: Separation"
-    #     """
-    # )
-    prompt_contact, prompt_separation, prompt_state, fb_contact, fb_separation = build_prompts(hand)
+    # prompt_contact, prompt_separation, prompt_state, fb_contact, fb_separation = build_prompts(hand)
+    prompt_contact, prompt_separation, prompt_state, fb_contact, fb_separation, fb_score_contact, fb_score_separation = build_prompts(
+        hand)
 
     # Iterate to narrow down the time
     video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -2173,12 +2919,7 @@ def process_task(
 
     json_path = get_json_path(video_name)
     json_folder_path = get_json_folder_path(video_name)
-    # 读取全部帧和速度
-    # with open(json_path, 'r') as f:
-    #     all_data = json.load(f)
-    # all_frames = np.array([x[0] for x in all_data])
-    # all_speeds = np.array([x[1] for x in all_data])
-    #  当前 hand 的单手速度
+
     scalar_data = _load_speed_scalar(str(json_path), hand=hand)
     if not scalar_data:
         print(f"[process_task] {video_name}, hand={hand} 没有有效速度数据")
@@ -2186,12 +2927,7 @@ def process_task(
 
     all_frames = np.array([x[0] for x in scalar_data])
     all_speeds = np.array([x[1] for x in scalar_data])
-    # 根据video_type选择极小值点提取函数
-    # if video_type == "short":
-    #     minima_indices = extract_local_minima_frames(video_name, json_folder_path)
-    #     minima_speeds = [all_speeds[np.where(all_frames == idx)[0][0]] for idx in minima_indices]
-    # else:
-    #     minima_indices, minima_speeds = extract_local_minima_frames_adaptive(video_name, json_folder_path)
+
     if video_type == "short":
         minima_indices = extract_local_minima_frames(video_name, json_folder_path, hand=hand)
         minima_speeds = [
@@ -2203,16 +2939,30 @@ def process_task(
             video_name, json_folder_path, hand=hand
         )
 
+    video_key = f"{video_name}.mp4"
+
+    # 去重 + 排序，防止采样过程影响原始 minima
+    clean_minima = sorted(set(int(x) for x in minima_indices))
+
+    # 写入全局缓存（注意：不要覆盖已有的）
+    if video_key not in minima_cache[hand]:
+        minima_cache[hand][video_key] = clean_minima
+
     print(f"{video_name}获取的极小值列表为:{minima_indices}")
     selected_frame_index = []
     while minima_indices:
         # 速度越小概率越高采样极小值点
-        selected_minima = adaptive_sample_speed(minima_indices, minima_speeds)
-        idx = minima_indices.index(selected_minima)
-        minima_indices.pop(idx)
-        minima_speeds.pop(idx)
+        #selected_minima = adaptive_sample_speed(minima_indices, minima_speeds)
+
+        #idx = minima_indices.index(selected_minima)
+
+        # minima_indices.pop(idx)
+        # minima_speeds.pop(idx)
+        # 直接顺序取第一个极小值
+        selected_minima = minima_indices.pop(0)
+        minima_speeds.pop(0)
         # 采样关键帧索引
-        window =8
+        window =2
         minima_idx = selected_minima
         #candidate_indices = [i for i in range(minima_idx - window, minima_idx + window + 1) if 0 <= i < total_frames]
         # 候选集合（就近映射到实际存在的 all_frames）
@@ -2242,14 +2992,14 @@ def process_task(
         else:
             keyframe_index = np.random.choice(candidate_indices)
         state_frame_indices, minima_index = select_frames_near_average(keyframe_index, 3, total_frames, [])
-        # state_indices = [state_frame_indices[0], state_frame_indices[-1]]
-        state_indices = list(state_frame_indices)  # 全部帧
-        # center = int(keyframe_index)
-        # state_indices = _build_mapped_window(center=center, window=2, all_frames_np=all_frames,
-        #                                      total_frames=total_frames)
-        # state_indices 长度通常是 5（去重后可能少一点）
+        state_indices = [state_frame_indices[0], state_frame_indices[-1]]
+        #state_indices = list(state_frame_indices)  # 全部帧
+
 
         print(f"选取的判断帧为{state_frame_indices[0]}和{state_frame_indices[-1]}")
+        print("state_indices:", state_indices)
+        print("n_state_frames =", len(state_indices))
+
         image_state = create_frame_grid_state(
             video_path, state_indices,hand=hand)
         image_RGB = cv2.cvtColor(image_state, cv2.COLOR_BGR2RGB)
@@ -2260,8 +3010,19 @@ def process_task(
         if hand=="left":
             grid_image.save(f"/home/EgoLoc/grid/left2/{video_name}_L{left_idx}_R{right_idx}.png")
         grid_image.save(debug_dir / f"{video_name}_state.png")
-        state = scene_understanding(
-            credentials, image_state, prompt_state, principle="state")
+        # state = scene_understanding(
+        #     credentials, image_state, prompt_state, principle="state")
+        state_raw = scene_understanding(
+            credentials, image_state, prompt_state, principle="state_score"
+        )
+        print("[RAW STATE OUTPUT]")
+        print(state_raw)
+        c_score, s_score = parse_state_scores(state_raw)
+        state = decide_state_from_scores(c_score, s_score)
+        print(f"[STATE DECISION] c={c_score}, s={s_score} → {state}")
+        # ✅ 记录下来（只接受三类）
+        if state in ["Contact", "Separation", "Neither","Ambiguous"]:
+            state_list.append(state)
         print("判断其状态为：", state)
         if state == "Contact" or state == "Separation":
             frame_indices, minima_index = select_frames_near_average(keyframe_index, grid_size, total_frames, [])
@@ -2275,6 +3036,11 @@ def process_task(
             prompt = prompt_contact if state == "Contact" else prompt_separation  # 统一为大写的contact
             description = scene_understanding(
                 credentials, image, prompt)
+            print(
+                f"[L2.5 GRID LOC] state={state}, grid_frames={frame_indices}, "
+                f"vlm_choice={description}"
+            )
+
             if description:
                 if description != -1:
                     if int(description) - 1 > len(frame_indices) - 1:
@@ -2283,56 +3049,142 @@ def process_task(
                     index_specified = max(
                         min(int(description) - 1, len(frame_indices) - 1), 0)
                     final_frame = frame_indices[index_specified]
-                    # === 反馈机制：对final_frame再用VLM判断状态 ===
+                    print(
+                        f"description choose:{final_frame}"
+                    )
+                    #=== 反馈机制：对final_frame再用VLM判断状态 ===
                     if use_feedback:
-                        feedback_window = 3
+                        # --- 可调参数（默认宽进严出） ---
+                        score_thr = 0.65 if state == "Contact" else 0.70
+                        feedback_window = 3  # 初始邻域
+                        ctx_win = 2  # 上下文窗口：中心±2，共5帧（推荐）
                         tried_frames = set()
                         correct = False
                         feedback_count = 0
-                        while feedback_count < max_feedback:
-                            tried_frames.add(final_frame)
-                            single_image = create_frame_grid_with_keyframe(video_path, [final_frame], 1)
-                            # if state == "Contact":
-                            #     feedback_prompt = (
-                            #         "I will show an image of hand-object interaction. "
-                            #         "You need to help me determine whether the hand and the object in the current image are in contact rather than just appearing to be in contact. "
-                            #         "If yes, answer 1. If not, answer 0.")
-                            # else:
-                            #     feedback_prompt = (
-                            #         "I will show an image of hand-object interaction. "
-                            #         "You need to help me determine whether the hand and the object in the current image are in seperate rather than just appearing to be in seperate. "
-                            #         "If yes, answer 1. If not, answer 0.")
-                            feedback_prompt = fb_contact if state == "Contact" else fb_separation
-                            feedback_result = scene_understanding(credentials, single_image, feedback_prompt, flag)
 
-                            feedback_result = scene_understanding(credentials, single_image, feedback_prompt, flag)
-                            print(f"反馈VLM输出: {feedback_result}")
-                            if is_positive_feedback(feedback_result):
-                                correct = True
-                                break
-                            # 采样新帧
-                            feedback_count += 1
-                            feedback_candidates = [i for i in range(final_frame - feedback_window,
-                                                                    final_frame + feedback_window + 1)
-                                                   if 0 <= i < total_frames and i not in tried_frames]
+                        # 选用 score prompt
+                        feedback_prompt = fb_score_contact if state == "Contact" else fb_score_separation
+
+                        while feedback_count < max_feedback:
+                            # 1) 构造候选集合（中心±feedback_window，排除试过的）
+                            feedback_candidates = [
+                                i for i in range(final_frame - feedback_window, final_frame + feedback_window + 1)
+                                if 0 <= i < total_frames and i not in tried_frames
+                            ]
                             if not feedback_candidates:
                                 break
-                            feedback_speeds = [
-                                all_speeds[np.where(all_frames == i)[0][0]] if np.any(all_frames == i) else 9999 for i
-                                in feedback_candidates]
-                            if keyframe_sampling_mode == "adaptive":
-                                inv_speeds = 1 / (np.array(feedback_speeds) + 1e-8)
-                                probabilities = inv_speeds / inv_speeds.sum()
-                                final_frame = np.random.choice(feedback_candidates, p=probabilities)
-                            else:
-                                final_frame = np.random.choice(feedback_candidates)
+
+                            # 2) 对每个候选打分，选最高分
+                            best = None  # (total_score, score_vlm, score_spd, frame, label, reason)
+                            for cand in feedback_candidates:
+                                tried_frames.add(cand)
+
+                                # ---- 上下文 1×K grid：让 VLM 看前后帧（强烈推荐）----
+                                ctx_frames = _build_mapped_window(cand, ctx_win, all_frames, total_frames)  # 你已有 helper
+                                ctx_img = create_frame_grid_with_keyframe(video_path, ctx_frames,
+                                                                          1)  # 1行grid（grid_size=1表示单格? 你这个函数是方阵！
+                                # ⚠️ 如果 create_frame_grid_with_keyframe 只能做方阵：
+                                # 你可以改用 create_frame_grid_state，它支持自动排版：
+                                # ctx_img = create_frame_grid_state(video_path, ctx_frames, hand=hand)
+
+                                feedback_result = scene_understanding(
+                                    credentials, ctx_img, feedback_prompt, principle="feedback"
+                                )
+                                score_vlm, label, reason = extract_score_info(feedback_result)
+
+                                if score_vlm is None or not np.isfinite(score_vlm):
+                                    continue
+                                score_vlm = float(np.clip(score_vlm, 0.0, 1.0))
+
+                                # ---- 速度先验：速度越小越加分（可选但很有用）----
+                                if np.any(all_frames == cand):
+                                    spd = float(all_speeds[np.where(all_frames == cand)[0][0]])
+                                else:
+                                    spd = 9999.0
+                                score_spd = 1.0 / (spd + 1e-6)  # 你也可以换 exp(-spd/tau)
+                                # 归一化到 0~1（粗暴一点就够用）
+                                score_spd = float(np.clip(score_spd / (score_spd + 1.0), 0.0, 1.0))
+
+                                total_score = 0.85 * score_vlm + 0.15 * score_spd
+
+                                if (best is None) or (total_score > best[0]):
+                                    best = (total_score, score_vlm, score_spd, cand, label, reason)
+
+                            if best is None:
+                                feedback_count += 1
+                                feedback_window += 2  # 没法评分就扩大范围
+                                continue
+
+                            # 3) 采用最高分帧作为新的 final_frame
+                            total_score, score_vlm, score_spd, cand, label, reason = best
+                            final_frame = cand
+
+                            print(f"[FEEDBACK] state={state} best_frame={cand} "
+                                  f"total={total_score:.3f} vlm={score_vlm:.3f} spd={score_spd:.3f} "
+                                  f"label={label} reason={reason}")
+
+                            # 4) 严出：过阈值才算 correct
+                            if score_vlm >= score_thr:
+                                correct = True
+                                break
+
+                            # 5) 仍未通过：扩大搜索范围，继续下一轮
+                            feedback_count += 1
+                            feedback_window += 2
+
                         if not correct:
-                            print("反馈后未找到合适帧或超出最大反馈次数，跳过该极小值点")
-                            continue
+                            print("反馈后未找到合适帧（评分未过阈值或超出最大反馈次数），跳过该极小值点")
+
+
+                    # if use_feedback:
+                    #     feedback_window = 3
+                    #     tried_frames = set()
+                    #     correct = False
+                    #     feedback_count = 0
+                    #     while feedback_count < max_feedback:
+                    #         tried_frames.add(final_frame)
+                    #         single_image = create_frame_grid_with_keyframe(video_path, [final_frame], 1)
+                    #
+                    #         feedback_prompt = fb_contact if state == "Contact" else fb_separation
+                    #
+                    #
+                    #         feedback_result = scene_understanding(credentials, single_image, feedback_prompt, principle="feedback")
+                    #         print(f"反馈VLM输出: {feedback_result}")
+                    #         if is_positive_feedback(feedback_result):
+                    #             correct = True
+                    #             break
+                    #         # 采样新帧
+                    #         feedback_count += 1
+                    #         feedback_candidates = [i for i in range(final_frame - feedback_window,
+                    #                                                 final_frame + feedback_window + 1)
+                    #                                if 0 <= i < total_frames and i not in tried_frames]
+                    #         if not feedback_candidates:
+                    #             break
+                    #         feedback_speeds = [
+                    #             all_speeds[np.where(all_frames == i)[0][0]] if np.any(all_frames == i) else 9999 for i
+                    #             in feedback_candidates]
+                    #         if keyframe_sampling_mode == "adaptive":
+                    #             inv_speeds = 1 / (np.array(feedback_speeds) + 1e-8)
+                    #             probabilities = inv_speeds / inv_speeds.sum()
+                    #             final_frame = np.random.choice(feedback_candidates, p=probabilities)
+                    #         else:
+                    #             final_frame = np.random.choice(feedback_candidates)
+                    #     if not correct:
+                    #         print("反馈后未找到合适帧或超出最大反馈次数，但并不跳过该极小值点")
+
                     # use_feedback为False时，直接采纳final_frame，无需反馈
                     selected_frame_index.append((state, final_frame))
-    return selected_frame_index
+    return selected_frame_index, state_list
 
+def load_json_safe(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r") as f:
+        return json.load(f)
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
 def calculate_max_mode_average(list_of_pairs_lists):
     """
@@ -2374,7 +3226,7 @@ def convert_video(video_file_path: str, action: str, credentials, grid_size: int
     video = cv2.VideoCapture(video_file_path)
     fps = video.get(cv2.CAP_PROP_FPS)
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    results = process_task(
+    results,state_list= process_task(
         credentials,
         video_file_path,
         grid_size,
@@ -2386,12 +3238,30 @@ def convert_video(video_file_path: str, action: str, credentials, grid_size: int
     # print(results)
     video_name = os.path.splitext(os.path.basename(video_file_path))[0]
     json_path = get_json_path(video_name)
-    # with open(json_path, 'r') as f:
-    #     speed_data = json.load(f)
-    # pair = get_contact_separation_pairs(results, speed_data)
+
     # 再次按 hand 取 (frame, speed)，给 get_contact_separation_pairs 用
     speed_data = _load_speed_scalar(str(json_path), hand=hand)
-    pair = get_contact_separation_pairs(results, speed_data)
+    # pair = get_contact_separation_pairs(results, speed_data)
+    # pair = get_contact_separation_pairs(
+    #     results=results,
+    #     video_path=video_file_path,
+    #     credentials=credentials,
+    #     max_contacts_per_query=12,
+    #     debug_dir=Path("/home/EgoLoc/debug_referee")  # 可选
+    # )
+    speed_data = _load_speed_scalar(str(json_path), hand=hand)
+
+    pair = level3_pairing(
+        results=results,
+        video_path=video_file_path,
+        credentials=credentials,
+        speed_data=speed_data,  # NEW
+        matching_cfg={"w_speed": 2.0},  # NEW (示例权重)
+        max_candidates_per_query=12,
+        max_rounds=3,
+        debug_dir=Path("/home/EgoLoc/debug_referee"),
+    )
+
     return pair
 
 
@@ -2412,75 +3282,37 @@ if not all(key in credentials for key in required_keys):
     raise ValueError("Required keys are missing in the credentials file")
 render_pos = 'topright'  # center or topright
 grid_size = int(pargs.grid)
-video_folder = "/home/EgoLoc/hand_data_drawer/twohands_test1"
+video_folder = "/home/EgoLoc/hand_data_drawer/ego4dvideo"
 action = pargs.action
 video_type = pargs.video_type
 folder_name = action.replace(" ", "_")
 output_folder = f"results/{folder_name}"
 # os.makedirs(output_folder, exist_ok=True)
 if __name__ == "__main__":
+    minima_cache = {
+        "left": {},  # video.mp4 -> [frame, frame, ...]
+        "right": {}
+    }
+    state_list = []  # ✅ 记录本视频本手，每次极小值触发的 state
     # 获取文件夹中的所有 MP4 文件并按顺序排序
     video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
     # save_path = "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"
-    speed_output_root = "/home/EgoLoc/hand_data_drawer/twohands_test_out15"
+    speed_output_root = "/home/EgoLoc/hand_data_drawer/ego4d_mp4_outputs"
     # save_path = "/home/VLM-Video-Action-Localization-main/VLM-Video-Action-Localization-main/result/greedyVLM_drawer_grid5.json"
     # 排序视频文件，基于文件名中 'c' 后的数字部分
     sorted_video_files = sorted(video_files, key=lambda x: int(x.split('.')[0][5:]))
     # all_predictions = load_predictions(save_path)
     #batch_process_videos(video_folder, speed_output_root, device="cuda", encoder="vits")  # 后续添加对已有文件的跳过
     # processed_video_files = {prediction[0] for prediction in all_predictions}
-    #
-    # # 按顺序遍历视频文件
-    # for video_file in sorted_video_files:
-    #     if video_file in processed_video_files:
-    #         continue
-    #     video_path = os.path.join(video_folder, video_file)
-    #     # video_path = "/home/bathroomCabinet/video_cleaned/video32.mp4"
-    #     if os.path.exists(video_path):
-    #         list_of_pair = []
-    #         for i in range(1):
-    #             pair = convert_video(
-    #                 video_path, action, credentials, grid_size, video_type=video_type, max_feedback=1)
-    #             list_of_pair.append(pair)
-    #
-    #         averaged_pairs = calculate_max_mode_average(list_of_pair)
-    #
-    #         if len(averaged_pairs) == 0:
-    #             print(f"{video_file} can't predict")
-    #             all_predictions.append([video_file, [(0, 0)]])
-    #         else:
-    #             print(f"{video_file} pairs: {averaged_pairs}")
-    #             all_predictions.append([video_file, averaged_pairs])
-    #
-    #         save_predictions(all_predictions, save_path)
-    #
-    # if video_type == "short":
-    #     result = evaluate_predictions(
-    #         json_path=save_path,
-    #         gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
-    #         sheet_name="Sheet9"  # 你也可以换其他sheet
-    #     )
-    #     print(result)
-    #
-    # elif video_type == "long":
-    #     results = evaluate_all(
-    #         pred_json=save_path,
-    #         gt_xlsx="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
-    #         sheet_name="hand_data_cabinet",
-    #         sr_tolerances=(1, 3, 5),
-    #         psr_tolerance=10
-    #     )
-    #     print("Evaluation Results:")
-    #     for k, v in results.items():
-    #         print(f"{k}: {v:.4f}")
+
     for hand in ["left", "right"]:
         print(f"\n====== 处理 {hand} 手 ======\n")
 
         # 每只手一份结果文件
         if hand == "right":
-            save_path = "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"
+            save_path = "/home/EgoLoc/ManiTIL_prompt/r16.json"
         else:
-            save_path = "/home/EgoLoc/ManiTIL_prompt/left_grid4.json"
+            save_path = "/home/EgoLoc/ManiTIL_prompt/l16.json"
 
         all_predictions = load_predictions(save_path)
         processed_video_files = {prediction[0] for prediction in all_predictions}
@@ -2501,39 +3333,91 @@ if __name__ == "__main__":
                     credentials,
                     grid_size,
                     video_type=video_type,
-                    max_feedback=1,
+                    max_feedback=3,
                     hand=hand,  # ⭐ 关键：这一轮是 hand
                 )
                 list_of_pair.append(pair)
 
             averaged_pairs = calculate_max_mode_average(list_of_pair)
+            with open("/home/EgoLoc/ManiTIL_prompt/minima_left_16.json", "w") as f:
+                json.dump(minima_cache["left"], f, indent=2)
 
+            with open("/home/EgoLoc/ManiTIL_prompt/minima_right_16.json", "w") as f:
+                json.dump(minima_cache["right"], f, indent=2)
             if len(averaged_pairs) == 0:
                 print(f"{video_file} ({hand}) can't predict")
-                all_predictions.append([video_file, [(0, 0)]])
+                all_predictions.append([video_file, []])
             else:
                 print(f"{video_file} ({hand}) pairs: {averaged_pairs}")
                 all_predictions.append([video_file, averaged_pairs])
 
             save_predictions(all_predictions, save_path)
 
-        # # 每只手各自评估一次
-        # if video_type == "short":
-        #     result = evaluate_predictions(
-        #         json_path=save_path,
-        #         gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
-        #         sheet_name="Sheet9"
-        #     )
-        #     print(f"\nEvaluation ({hand}):", result)
-        #
-        # elif video_type == "long":
-        #     results_eval = evaluate_all(
-        #         pred_json=save_path,
-        #         gt_xlsx="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
-        #         sheet_name="hand_data_cabinet",
-        #         sr_tolerances=(1, 3, 5),
-        #         psr_tolerance=10
-        #     )
-        #     print(f"\nEvaluation ({hand}):")
-        #     for k, v in results_eval.items():
-        #         print(f"{k}: {v:.4f}")
+        # 每只手各自评估一次
+        if video_type == "short":
+            result = evaluate_predictions(
+                json_path=save_path,
+                gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
+                sheet_name="Sheet9"
+            )
+            print(f"\nEvaluation ({hand}):", result)
+
+        elif video_type == "long":
+            gt_json = "/home/EgoLoc/hand_data_drawer/ego4dvideo/result.json"
+
+            pred_left = "/home/EgoLoc/ManiTIL_prompt/l16.json"
+            pred_right = "/home/EgoLoc/ManiTIL_prompt/r16.json"
+
+            results_left = evaluate_all_stages(
+                pred_json_path=pred_left,
+                gt_json_path=gt_json,
+                hand="left",
+
+                minima_json_path="/home/EgoLoc/ManiTIL_prompt/minima_left_16.json"
+            )
+
+            results_right = evaluate_all_stages(
+                pred_json_path=pred_right,
+                gt_json_path=gt_json,
+                hand="right",
+
+                minima_json_path="/home/EgoLoc/ManiTIL_prompt/minima_right_16.json"
+            )
+
+            print("\nEvaluation (left):")
+            for k, v in results_left.items():
+                if isinstance(v, (int, float)) and v is not None:
+                    print(f"{k}: {v:.4f}")
+                else:
+                    print(f"{k}: {v}")
+
+            print("\nEvaluation (right):")
+            for k, v in results_right.items():
+                if isinstance(v, (int, float)) and v is not None:
+                    print(f"{k}: {v:.4f}")
+                else:
+                    print(f"{k}: {v}")
+
+
+            # ---- 可选：左右手整体平均（只平均 stage3 里的数值指标）----
+            results_both = {
+                "hand": "both",
+                "stage3": {},
+            }
+
+            # 你要平均的指标（stage3）
+            keys_to_avg = ["SR@1", "SR@3", "SR@5", "PSR", "mae", "MoF", "IoU"]
+
+            for k in keys_to_avg:
+                a = results_left.get("stage3", {}).get(k, None)
+                b = results_right.get("stage3", {}).get(k, None)
+                vals = [x for x in [a, b] if isinstance(x, (int, float)) and x is not None]
+                results_both["stage3"][k] = float(np.mean(vals)) if vals else None
+
+            print("\nEvaluation (both-avg):")
+            print("hand:", results_both["hand"])
+            for k in keys_to_avg:
+                v = results_both["stage3"][k]
+                print(f"{k}: {v:.4f}" if isinstance(v, (int, float)) else f"{k}: None")
+
+

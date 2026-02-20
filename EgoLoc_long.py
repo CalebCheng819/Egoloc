@@ -1535,7 +1535,7 @@ if not all(key in credentials for key in required_keys):
     raise ValueError("Required keys are missing in the credentials file")
 render_pos = 'topright'  # center or topright
 grid_size = int(pargs.grid)
-video_folder = "/home/EgoLoc/hand_data_drawer/right_videos"
+video_folder = "/home/EgoLoc/hand_data_drawer/EgoPAT3D/EgoPAT3D"
 action = pargs.action
 video_type = pargs.video_type
 folder_name = action.replace(" ", "_")
@@ -1545,57 +1545,57 @@ if __name__ == "__main__":
     # 获取文件夹中的所有 MP4 文件并按顺序排序
     video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
     save_path = "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"
-    speed_output_root = "/home/EgoLoc/hand_data_drawer/3D_hand_right"
+    speed_output_root = "/home/EgoLoc/results2"
     # save_path = "/home/VLM-Video-Action-Localization-main/VLM-Video-Action-Localization-main/result/greedyVLM_drawer_grid5.json"
     # 排序视频文件，基于文件名中 'c' 后的数字部分
     sorted_video_files = sorted(video_files, key=lambda x: int(x.split('.')[0][5:]))
     all_predictions = load_predictions(save_path)
-    #batch_process_videos(video_folder, speed_output_root, device="cuda", encoder="vits")  # 后续添加对已有文件的跳过
-    processed_video_files = {prediction[0] for prediction in all_predictions}
-
-    # 按顺序遍历视频文件
-    for video_file in sorted_video_files:
-        if video_file in processed_video_files:
-            continue
-        video_path = os.path.join(video_folder, video_file)
-        # video_path = "/home/bathroomCabinet/video_cleaned/video32.mp4"
-        if os.path.exists(video_path):
-            list_of_pair = []
-            for i in range(1):
-                pair = convert_video(
-                    video_path, action, credentials, grid_size, video_type=video_type, max_feedback=1)
-                list_of_pair.append(pair)
-
-            averaged_pairs = calculate_max_mode_average(list_of_pair)
-
-            if len(averaged_pairs) == 0:
-                print(f"{video_file} can't predict")
-                all_predictions.append([video_file, [(0, 0)]])
-            else:
-                print(f"{video_file} pairs: {averaged_pairs}")
-                all_predictions.append([video_file, averaged_pairs])
-
-            save_predictions(all_predictions, save_path)
-
-    if video_type == "short":
-        result = evaluate_predictions(
-            json_path=save_path,
-            gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
-            sheet_name="Sheet9"  # 你也可以换其他sheet
-        )
-        print(result)
-
-    elif video_type == "long":
-        results = evaluate_all(
-            pred_json=save_path,
-            gt_xlsx="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
-            sheet_name="hand_data_cabinet",
-            sr_tolerances=(1, 3, 5),
-            psr_tolerance=10
-        )
-        print("Evaluation Results:")
-        for k, v in results.items():
-            print(f"{k}: {v:.4f}")
+    batch_process_videos(video_folder, speed_output_root, device="cuda", encoder="vits")  # 后续添加对已有文件的跳过
+    # processed_video_files = {prediction[0] for prediction in all_predictions}
+    #
+    # # 按顺序遍历视频文件
+    # for video_file in sorted_video_files:
+    #     if video_file in processed_video_files:
+    #         continue
+    #     video_path = os.path.join(video_folder, video_file)
+    #     # video_path = "/home/bathroomCabinet/video_cleaned/video32.mp4"
+    #     if os.path.exists(video_path):
+    #         list_of_pair = []
+    #         for i in range(1):
+    #             pair = convert_video(
+    #                 video_path, action, credentials, grid_size, video_type=video_type, max_feedback=1)
+    #             list_of_pair.append(pair)
+    #
+    #         averaged_pairs = calculate_max_mode_average(list_of_pair)
+    #
+    #         if len(averaged_pairs) == 0:
+    #             print(f"{video_file} can't predict")
+    #             all_predictions.append([video_file, [(0, 0)]])
+    #         else:
+    #             print(f"{video_file} pairs: {averaged_pairs}")
+    #             all_predictions.append([video_file, averaged_pairs])
+    #
+    #         save_predictions(all_predictions, save_path)
+    #
+    # if video_type == "short":
+    #     result = evaluate_predictions(
+    #         json_path=save_path,
+    #         gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
+    #         sheet_name="Sheet9"  # 你也可以换其他sheet
+    #     )
+    #     print(result)
+    #
+    # elif video_type == "long":
+    #     results = evaluate_all(
+    #         pred_json=save_path,
+    #         gt_xlsx="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
+    #         sheet_name="hand_data_cabinet",
+    #         sr_tolerances=(1, 3, 5),
+    #         psr_tolerance=10
+    #     )
+    #     print("Evaluation Results:")
+    #     for k, v in results.items():
+    #         print(f"{k}: {v:.4f}")
 
 
 
