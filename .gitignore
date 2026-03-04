@@ -1,0 +1,8 @@
+# 忽略所有文件
+*
+
+# 但保留 python 脚本
+!*.py
+
+# 保留 .gitignore 本身
+!.gitignore

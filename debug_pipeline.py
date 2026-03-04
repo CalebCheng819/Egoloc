@@ -10,6 +10,7 @@ Usage (inside Docker):
 
 import argparse
 import csv
+import math
 import os
 import sys
 from pathlib import Path
@@ -116,6 +117,19 @@ def classify_frame(boxL, boxR, wristL, wristR, zL_m, zR_m, prev_zL, prev_zR):
     return "partial"
 
 
+def _roi_validation_stats(depth, x0, y0, x1, y1):
+    """返回 ROI 的 roi_w, roi_h, area, valid_count, valid_ratio（用于自证实验）"""
+    if depth is None or x1 <= x0 or y1 <= y0:
+        return None
+    roi = depth[y0:y1, x0:x1].astype(np.float32)
+    valid = roi[np.isfinite(roi) & (roi > 0)]
+    area = roi.size
+    return {
+        "roi_w": x1 - x0, "roi_h": y1 - y0, "area": area,
+        "valid_count": valid.size, "valid_ratio": valid.size / area if area else 0,
+    }
+
+
 def status_color(status):
     if status.startswith("CRASH"):
         return COLORS["crash"]
@@ -128,20 +142,28 @@ def main():
     parser = argparse.ArgumentParser(description="Debug pipeline visualization")
     parser.add_argument("--video", default="video12", help="Video name (e.g. video12)")
     parser.add_argument("--dataset", default="EgoDex_short", help="Dataset folder name")
-    parser.add_argument("--base", default="/home/EgoLoc/hand_data_drawer",
-                        help="Base data dir")
+    parser.add_argument("--base", default=None,
+                        help="Base data dir (default: /home/EgoLoc/hand_data_drawer or script_dir/hand_data_drawer)")
     parser.add_argument("--out", default=None, help="Output dir (default: base/debug_grids/VIDEO)")
     args = parser.parse_args()
 
     vname = args.video
-    base = Path(args.base)
+    if args.base is not None:
+        base = Path(args.base)
+    else:
+        for cand in ["/home/EgoLoc/hand_data_drawer", Path(__file__).resolve().parent / "hand_data_drawer"]:
+            if Path(cand).exists():
+                base = Path(cand)
+                break
+        else:
+            base = Path("/home/EgoLoc/hand_data_drawer")
     depth_dir = base / args.dataset / vname / "depth"
 
     video_path = None
     for candidate in [
-        
         base / args.dataset / f"{vname}.mp4",
         Path(f"/data/EgoLoc/EgoDex/short/{vname}.mp4"),
+        Path(f"/data0/dataset/EgoLoc/EgoDex/short/{vname}.mp4"),
     ]:
         if candidate.exists():
             video_path = candidate
@@ -174,7 +196,7 @@ def main():
     csv_f = open(csv_path, "w", newline="")
     writer = csv.writer(csv_f)
     writer.writerow([
-        "frame", "dino_detections", "boxL", "boxR",
+        "frame", "frame_H", "frame_W", "dino_detections", "boxL", "boxR",
         "wristL", "wristR", "zL_m", "zR_m",
         "prev_zL", "prev_zR", "status"
     ])
@@ -210,8 +232,37 @@ def main():
 
         dino_count = (1 if boxL is not None else 0) + (1 if boxR is not None else 0)
 
-        zL_m = depth_from_hand_roi_meters(depth, boxL, prev_z=prev_zL) if boxL is not None else None
-        zR_m = depth_from_hand_roi_meters(depth, boxR, prev_z=prev_zR) if boxR is not None else None
+        fh, fw = frame.shape[:2]
+        if idx == 0:
+            print(f"[DEBUG] DINO input = frame.shape {fh}x{fw} -> boxes in frame coords")
+        zL_m = depth_from_hand_roi_meters(depth, boxL, prev_z=prev_zL, frame_H=fh, frame_W=fw) if boxL is not None else None
+        zR_m = depth_from_hand_roi_meters(depth, boxR, prev_z=prev_zR, frame_H=fh, frame_W=fw) if boxR is not None else None
+
+        # 自证实验：frame 20 时对比 A) 不缩放 B) 缩放 box 的 ROI 指标
+        if idx == 20 and boxR is not None and depth is not None:
+            H_d, W_d = depth.shape[:2]
+            bx0, by0, bx1, by1 = map(int, boxR)
+            # A) 不缩放直接 clip
+            x0_a = max(0, min(bx0, W_d - 1))
+            x1_a = max(0, min(bx1, W_d))
+            y0_a = max(0, min(by0, H_d - 1))
+            y1_a = max(0, min(by1, H_d))
+            stats_a = _roi_validation_stats(depth, x0_a, y0_a, x1_a, y1_a)
+            # B) 缩放 box 到 depth 坐标
+            scale_x = W_d / fw
+            scale_y = H_d / fh
+            bx0_s = int(math.floor(bx0 * scale_x))
+            bx1_s = int(math.ceil(bx1 * scale_x))
+            by0_s = int(math.floor(by0 * scale_y))
+            by1_s = int(math.ceil(by1 * scale_y))
+            x0_b = max(0, min(bx0_s, W_d - 1))
+            x1_b = max(0, min(bx1_s, W_d))
+            y0_b = max(0, min(by0_s, H_d - 1))
+            y1_b = max(0, min(by1_s, H_d))
+            stats_b = _roi_validation_stats(depth, x0_b, y0_b, x1_b, y1_b)
+            print(f"[VALIDATE frame 20] frame.shape={fh}x{fw} depth.shape={H_d}x{W_d} boxR={boxR}")
+            print(f"  A) no scale: roi_w={stats_a['roi_w']} roi_h={stats_a['roi_h']} area={stats_a['area']} valid={stats_a['valid_count']} ratio={stats_a['valid_ratio']:.3f}" if stats_a else "  A) no scale: empty ROI")
+            print(f"  B) scaled:   roi_w={stats_b['roi_w']} roi_h={stats_b['roi_h']} area={stats_b['area']} valid={stats_b['valid_count']} ratio={stats_b['valid_ratio']:.3f}" if stats_b else "  B) scaled: empty ROI")
 
         wrists = _wrist_from_frame(frame, depth, cpm, detector=detector, verbose=False)
         wrists = fix_left_right_identity(wrists, prev_uL, prev_uR)
@@ -248,7 +299,7 @@ def main():
             return f"[{b[0]},{b[1]},{b[2]},{b[3]}]" if b else ""
 
         writer.writerow([
-            idx, dino_count, fmt_box(boxL), fmt_box(boxR),
+            idx, fh, fw, dino_count, fmt_box(boxL), fmt_box(boxR),
             fmt_pt(wristL), fmt_pt(wristR),
             f"{zL_m:.4f}" if zL_m else "",
             f"{zR_m:.4f}" if zR_m else "",

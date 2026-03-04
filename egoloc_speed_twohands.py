@@ -271,19 +271,22 @@ def _remove_depth_tensors(depth_dir: Path, indices: List[int]) -> None:
 # -------------------------------------------------------------------------
 # Depth loading helper
 # ---------------------------------------------------------------------------
-def _load_depth(depth_dir: Path, idx: int) -> Optional[np.ndarray]:
+def _load_depth(depth_dir: Path, idx: int, mmap: bool = True) -> Optional[np.ndarray]:
     """
     VDA stores **inverse depth** (bigger = nearer).
     Convert to metric depth in metres and keep a useful range.
+    mmap=True: use memory-mapped load to reduce copy overhead.
     """
     f = depth_dir / f"pred_depth_{idx:06d}.npy"
     if not f.exists():
         return None
-    inv = np.load(f).astype(np.float32)          # (H, W)
-    if _is_invalid_inv(inv):                     # ← early-reject unusable tensor
+    inv = np.load(f, mmap_mode="r" if mmap else None)
+    if inv.dtype != np.float32:
+        inv = np.asarray(inv, dtype=np.float32)
+    if _is_invalid_inv(inv):
         return None
-    depth = DEPTH_SCALE_M / (inv + 1e-6)         # invert once, not twice
-    return depth
+    depth = DEPTH_SCALE_M / (inv + 1e-6)
+    return np.asarray(depth, dtype=np.float32)
 
 # 对每一帧你有两个 wrist 候选 a, b（来自ViTPose的 left/right）。
 # 设上一帧稳定的 prev_L, prev_R。
@@ -312,6 +315,23 @@ def _pixel_to_camera(u: float, v: float, z: float, W: int, H: int):
     X = (u - cx) * z / fx
     Y = (v - cy) * z / fy
     return X, Y, z
+
+
+def _wrist_to_cam3d_if_valid(
+    wrist_uv: Optional[Tuple[float, float]],
+    z_m: Optional[float],
+    W: int, H: int
+) -> Optional[Tuple[float, float, float]]:
+    """
+    2D 手腕 + 深度 → 3D 相机坐标（毫米）。
+    wrist 或 z_m 任一无效则返回 None，不产生 3D 点、不更新 tracking。
+    """
+    if wrist_uv is None or z_m is None:
+        return None
+    u, v = wrist_uv
+    z_mm = float(z_m) * 1000.0
+    X, Y, Z = _pixel_to_camera(u, v, z_mm, W, H)
+    return (float(X), float(Y), float(Z))
 
 
 import numpy as np
@@ -652,6 +672,24 @@ VDA_DIR = REPO_ROOT / "Video-Depth-Anything"
 
 DEPTH_SCALE_M = 3.0  # pixel value 255 ↔ 3 m (linear scaling)
 MAX_FEEDBACKS = 1
+def _sample_roi_depth(
+    depth: np.ndarray,
+    x0: int, y0: int, x1: int, y1: int,
+    min_valid: int,
+    drop_extreme_ratio: float = 0.10,
+) -> Optional[float]:
+    """在给定 ROI 内采样深度（米），valid 不足则返回 None。"""
+    roi = depth[y0:y1, x0:x1].astype(np.float32)
+    valid = roi[np.isfinite(roi) & (roi > 0)]
+    if valid.size < min_valid:
+        return None
+    valid.sort()
+    n = valid.size
+    k = int(drop_extreme_ratio * n)
+    valid2 = valid[k:n - k] if 2 * k < n else valid
+    return float(np.median(valid2))
+
+
 def depth_from_hand_roi_meters(
     depth: np.ndarray,
     box_xyxy: list,
@@ -661,34 +699,70 @@ def depth_from_hand_roi_meters(
     max_jump: float = 0.10,        # meters/frame
     ema_alpha: float = 0.60,
     min_valid: int = 20,
+    min_roi_side: int = 10,
+    frame_H: Optional[int] = None,  # box 对应的 frame 尺寸（与 depth 不同时做缩放）
+    frame_W: Optional[int] = None,
 ):
+    """
+    从 hand box ROI 内采样深度（米）。
+    P0: ROI 严格 clip + min_roi_side 面积检查。
+    P1: valid 不足时依次尝试全框 → 中心 40%×40% → 中心 20%×20%。
+    P2: frame_H/frame_W 与 depth 尺寸不同时，将 box 从 frame 坐标系缩放到 depth 坐标系。
+    """
     if depth is None or box_xyxy is None:
         return prev_z
 
-    H, W = depth.shape[:2]
-    x0, y0, x1, y1 = map(int, box_xyxy)
-    x0 = max(0, min(W - 1, x0)); x1 = max(0, min(W, x1))
-    y0 = max(0, min(H - 1, y0)); y1 = max(0, min(H, y1))
-    if x1 <= x0 or y1 <= y0:
+    H_d, W_d = depth.shape[:2]
+    bx0, by0, bx1, by1 = map(int, box_xyxy)
+
+    # P2: box 从 frame 坐标缩放到 depth 坐标（坑 A：x0 floor, x1 ceil 避免 ROI 变空）
+    if frame_H is not None and frame_W is not None and (H_d, W_d) != (frame_H, frame_W):
+        scale_x = W_d / frame_W
+        scale_y = H_d / frame_H
+        bx0 = int(math.floor(bx0 * scale_x))
+        bx1 = int(math.ceil(bx1 * scale_x))
+        by0 = int(math.floor(by0 * scale_y))
+        by1 = int(math.ceil(by1 * scale_y))
+
+    # 坑 A：缩放后若 ROI 变空，直接 return prev_z
+    if bx1 <= bx0 or by1 <= by0:
         return prev_z
 
-    roi = depth[y0:y1, x0:x1].astype(np.float32)
-    valid = roi[np.isfinite(roi) & (roi > 0)]
-    if valid.size < min_valid:
-        return prev_z
+    def clip_and_check(x0, y0, x1, y1):
+        # 坑 A：上界用 W_d/H_d（允许等于），下界用 W_d-1/H_d-1
+        x0 = max(0, min(x0, W_d - 1))
+        x1 = max(0, min(x1, W_d))
+        y0 = max(0, min(y0, H_d - 1))
+        y1 = max(0, min(y1, H_d))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        if (x1 - x0) < min_roi_side or (y1 - y0) < min_roi_side:
+            return None
+        return (x0, y0, x1, y1)
 
-    valid.sort()
-    n = valid.size
-    k = int(drop_extreme_ratio * n)
-    valid2 = valid[k:n-k] if 2*k < n else valid
-    z_now = float(np.median(valid2))  # meters
-
-    if prev_z is not None and np.isfinite(prev_z):
-        dz = z_now - float(prev_z)
-        if abs(dz) > max_jump:
-            z_now = float(prev_z) + float(np.clip(dz, -max_jump, max_jump))
-        z_now = float(ema_alpha * z_now + (1.0 - ema_alpha) * float(prev_z))
-    return z_now
+    # P1: 依次尝试 全框 → 中心 40% → 中心 20%
+    for frac in [1.0, 0.4, 0.2]:
+        cx = (bx0 + bx1) / 2
+        cy = (by0 + by1) / 2
+        hw = (bx1 - bx0) * frac / 2
+        hh = (by1 - by0) * frac / 2
+        sx0 = int(math.floor(cx - hw))
+        sx1 = int(math.ceil(cx + hw))
+        sy0 = int(math.floor(cy - hh))
+        sy1 = int(math.ceil(cy + hh))
+        clipped = clip_and_check(sx0, sy0, sx1, sy1)
+        if clipped is None:
+            continue
+        x0, y0, x1, y1 = clipped
+        z_now = _sample_roi_depth(depth, x0, y0, x1, y1, min_valid, drop_extreme_ratio)
+        if z_now is not None:
+            if prev_z is not None and np.isfinite(prev_z):
+                dz = z_now - float(prev_z)
+                if abs(dz) > max_jump:
+                    z_now = float(prev_z) + float(np.clip(dz, -max_jump, max_jump))
+                z_now = float(ema_alpha * z_now + (1.0 - ema_alpha) * float(prev_z))
+            return z_now
+    return prev_z
 def get_twohand_boxes_groundingdino(
     frame_bgr: np.ndarray,
     *,
@@ -792,6 +866,201 @@ def get_twohand_boxes_groundingdino(
     new_prev_L = boxL if boxL is not None else prev_box_L
     new_prev_R = boxR if boxR is not None else prev_box_R
     return boxL, boxR, new_prev_L, new_prev_R
+
+
+def _predict_dino_batch(model, tensors: list, caption: str, box_thresh: float, text_thresh: float, device: str = "cuda"):
+    """
+    Batch DINO inference. tensors: list of (C,H,W) tensors.
+    Returns list of (boxes_norm, logits, phrases) per image.
+    """
+    if not tensors:
+        return []
+    import torch
+    from groundingdino.util.inference import preprocess_caption
+    from groundingdino.util.utils import get_phrases_from_posmap
+
+    caption = preprocess_caption(caption)
+    model = model.to(device)
+
+    # Stack or pad to same size
+    shapes = [t.shape for t in tensors]
+    if len(set(shapes)) == 1:
+        batch = torch.stack(tensors, dim=0).to(device)
+    else:
+        max_h = max(t.shape[1] for t in tensors)
+        max_w = max(t.shape[2] for t in tensors)
+        padded = []
+        for t in tensors:
+            c, h, w = t.shape
+            if h < max_h or w < max_w:
+                pad = torch.zeros(1, c, max_h, max_w, dtype=t.dtype, device=t.device)
+                pad[0, :, :h, :w] = t.unsqueeze(0)
+                padded.append(pad)
+            else:
+                padded.append(t.unsqueeze(0))
+        batch = torch.cat(padded, dim=0).to(device)
+
+    with torch.no_grad():
+        outputs = model(batch, captions=[caption] * len(tensors))
+
+    pred_logits = outputs["pred_logits"].cpu().sigmoid()
+    pred_boxes = outputs["pred_boxes"].cpu()
+    tokenizer = model.tokenizer
+    tokenized = tokenizer(caption)
+
+    results = []
+    for b in range(len(tensors)):
+        mask = pred_logits[b].max(dim=1)[0] > box_thresh
+        logits_b = pred_logits[b][mask]
+        boxes_b = pred_boxes[b][mask]
+        phrases_b = [
+            get_phrases_from_posmap(lg > text_thresh, tokenized, tokenizer).replace(".", "")
+            for lg in logits_b
+        ]
+        logits_1d = logits_b.max(dim=1)[0] if logits_b.numel() > 0 else pred_logits[b].max(dim=1)[0][:0]
+        results.append((boxes_b, logits_1d, phrases_b))
+    return results
+
+
+def get_twohand_boxes_groundingdino_batch(
+    frames: List[np.ndarray],
+    *,
+    model,
+    load_image_fn,
+    box_thresh=0.30,
+    text_thresh=0.25,
+    expand_ratio=0.20,
+    prev_box_L=None,
+    prev_box_R=None,
+    batch_size=4,
+) -> List[Tuple]:
+    """
+    Batch version: process multiple frames in one DINO forward.
+    Returns list of (boxL, boxR, new_prev_L, new_prev_R) for each frame.
+    """
+    import tempfile
+    import os
+
+    if not frames:
+        return []
+
+    H, W = frames[0].shape[:2]
+    tensors = []
+    tmp_files = []
+    for f in frames:
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        tmp_files.append(tmp.name)
+        cv2.imwrite(tmp.name, f)
+        _, tensor_img = load_image_fn(tmp.name)
+        tensors.append(tensor_img)
+    for t in tmp_files:
+        try:
+            os.unlink(t)
+        except OSError:
+            pass
+
+    batch_results = _predict_dino_batch(model, tensors, "hand", box_thresh, text_thresh)
+
+    def xyxy_from_cxcywh_norm(b, W, H):
+        if hasattr(b, "cpu"):
+            b = b.cpu().numpy()
+        b = np.asarray(b).ravel()
+        if len(b) < 4:
+            return None
+        cx, cy, bw, bh = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+        x0 = int((cx - bw / 2) * W)
+        y0 = int((cy - bh / 2) * H)
+        x1 = int((cx + bw / 2) * W)
+        y1 = int((cy + bh / 2) * H)
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return [x0, y0, x1, y1]
+
+    def box_center_x(box):
+        return (box[0] + box[2]) / 2.0
+
+    def iou(a, b):
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+        ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+        iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+        inter = iw * ih
+        area_a = (ax1 - ax0) * (ay1 - ay0)
+        area_b = (bx1 - bx0) * (by1 - by0)
+        return inter / (area_a + area_b - inter + 1e-6)
+
+    def expand(box, W, H):
+        x0, y0, x1, y1 = box
+        w, h = x1 - x0, y1 - y0
+        ex, ey = int(w * expand_ratio), int(h * expand_ratio)
+        return [max(0, x0 - ex), max(0, y0 - ey), min(W, x1 + ex), min(H, y1 + ey)]
+
+    out = []
+    pL, pR = prev_box_L, prev_box_R
+    for b, (boxes_norm, logits, phrases) in enumerate(batch_results):
+        if boxes_norm is None or (hasattr(boxes_norm, "numel") and boxes_norm.numel() == 0):
+            out.append((None, None, pL, pR))
+            continue
+
+        candidates = []
+        nbox = len(boxes_norm)
+        for k in range(nbox):
+            bk = boxes_norm[k]
+            if hasattr(bk, "cpu"):
+                bk = bk.cpu().numpy()
+            box = xyxy_from_cxcywh_norm(bk, W, H)
+            if box is None:
+                continue
+            sc = float(logits[k]) if logits is not None and k < len(logits) else 0.0
+            candidates.append((box, sc))
+
+        if not candidates:
+            out.append((None, None, pL, pR))
+            continue
+
+        used = set()
+        boxL = boxR = None
+        if pL is not None:
+            ranked = sorted(
+                [(i, iou(candidates[i][0], pL), candidates[i][1]) for i in range(len(candidates))],
+                key=lambda x: (x[1], x[2]),
+                reverse=True,
+            )
+            for i, _, _ in ranked:
+                if i not in used:
+                    boxL = candidates[i][0]
+                    used.add(i)
+                    break
+        if pR is not None:
+            ranked = sorted(
+                [(i, iou(candidates[i][0], pR), candidates[i][1]) for i in range(len(candidates))],
+                key=lambda x: (x[1], x[2]),
+                reverse=True,
+            )
+            for i, _, _ in ranked:
+                if i not in used:
+                    boxR = candidates[i][0]
+                    used.add(i)
+                    break
+
+        remaining = [candidates[i] for i in range(len(candidates)) if i not in used]
+        if boxL is None and remaining:
+            boxL = sorted(remaining, key=lambda bs: box_center_x(bs[0]))[0][0]
+        if boxR is None and remaining:
+            boxR = sorted(remaining, key=lambda bs: box_center_x(bs[0]))[-1][0]
+
+        if boxL is not None:
+            boxL = expand(boxL, W, H)
+        if boxR is not None:
+            boxR = expand(boxR, W, H)
+        pL = boxL if boxL is not None else pL
+        pR = boxR if boxR is not None else pR
+        out.append((boxL, boxR, pL, pR))
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -968,7 +1237,46 @@ def compute_central_speed(pos_dict, total_frames):
     return speed
 
 
-def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: str = "cuda", encoder: str = "vits") -> Tuple[List[List[float]], str, str, str]:
+def _check_and_log_speed_stats(video_name: str, speed_pairs: List[List[float]], total_frames: int) -> None:
+    """
+    自检速度输出：校验数量、统计有效帧、检测异常，并打印简要统计。
+    """
+    n = len(speed_pairs)
+    if n == 0:
+        log.warning("[speed] %s: empty speed_pairs", video_name)
+        return
+    if n != total_frames:
+        log.warning("[speed] %s: pairs=%d vs total_frames=%d (mismatch)", video_name, n, total_frames)
+
+    vL_list = [p[1] for p in speed_pairs if len(p) >= 2]
+    vR_list = [p[2] for p in speed_pairs if len(p) >= 3]
+    valid_L = sum(1 for v in vL_list if v > 0 and np.isfinite(v))
+    valid_R = sum(1 for v in vR_list if v > 0 and np.isfinite(v))
+    valid_any = sum(1 for p in speed_pairs if len(p) >= 3 and ((p[1] > 0 and np.isfinite(p[1])) or (p[2] > 0 and np.isfinite(p[2]))))
+
+    max_L = max(vL_list) if vL_list else 0.0
+    max_R = max(vR_list) if vR_list else 0.0
+    mean_L = float(np.mean(vL_list)) if vL_list else 0.0
+    mean_R = float(np.mean(vR_list)) if vR_list else 0.0
+
+    # 异常检测
+    all_zero = valid_any == 0
+    very_few = valid_any < max(5, total_frames * 0.05)
+    extreme = (max_L > 5.0 or max_R > 5.0)  # 世界系速度 > 5 单位/帧 视为异常
+
+    log.info(
+        "[speed] %s: frames=%d pairs=%d | L: valid=%d max=%.4f mean=%.4f | R: valid=%d max=%.4f mean=%.4f",
+        video_name, total_frames, n, valid_L, max_L, mean_L, valid_R, max_R, mean_R,
+    )
+    if all_zero:
+        log.warning("[speed] %s: all frames zero speed (possible failure)", video_name)
+    elif very_few:
+        log.warning("[speed] %s: only %d frames with non-zero speed (%.1f%%)", video_name, valid_any, valid_any / max(1, n) * 100)
+    if extreme:
+        log.warning("[speed] %s: extreme speed values (L=%.2f R=%.2f)", video_name, max_L, max_R)
+
+
+def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: str = "cuda", encoder: str = "vits", dino_batch_size: int = 4) -> Tuple[List[List[float]], str, str, str]:
     """
     返回：
       - speed_pairs: [[frame, speed], ...]
@@ -1049,164 +1357,131 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
     prev_box_L = None
     prev_box_R = None
 
-    for idx in range(total_frames):
-        ok, frame = cap.read()
-        if not ok:
-            speed_cam[idx] = 0.0
-            # prev_cam = None
-            prev_cam_L = None
-            prev_cam_R = None
-            continue
-        depth = _load_depth(depth_dir, idx)
-        # --- 用 DINO 获取左右手框（带 prev_box 稳定） ---
-        boxL, boxR, prev_box_L, prev_box_R = get_twohand_boxes_groundingdino(
-            frame,
-            model=_model,
-            load_image_fn=load_image,
-            predict_fn=predict,
-            box_thresh=0.30,
-            text_thresh=0.25,
-            expand_ratio=0.20,
-            prev_box_L=prev_box_L,
-            prev_box_R=prev_box_R,
-        )
+    # 深度预加载：避免主循环内频繁读磁盘（长视频限制 2000 帧防 OOM）
+    max_preload = 2000
+    if total_frames <= max_preload:
+        depths = [_load_depth(depth_dir, i) for i in range(total_frames)]
+    else:
+        depths = None
 
-        # --- ROI 鲁棒深度（单位：m） ---
-        zL_m = depth_from_hand_roi_meters(depth, boxL, prev_z=prev_zL) if boxL is not None else None
-        zR_m = depth_from_hand_roi_meters(depth, boxR, prev_z=prev_zR) if boxR is not None else None
+    detector = _get_body_detector()
+    batch_size = max(1, min(dino_batch_size, 8))
 
-        # 更新上一帧深度（m）
-        prev_zL = zL_m if zL_m is not None else prev_zL
-        prev_zR = zR_m if zR_m is not None else prev_zR
-
-        if depth is None:
-            speed_cam[idx] = 0.0
-            # prev_cam = None
-            prev_cam_L = None
-            prev_cam_R = None
-            continue
-
-        H, W = depth.shape
-        # wrists = _wrist_from_frame(frame, depth, cpm)
-        detector = _get_body_detector()
-        wrists= _wrist_from_frame(frame, depth, cpm, detector=detector, verbose=True)
-        wrists = fix_left_right_identity(wrists, prev_uL, prev_uR)
-        lw = wrists["left"]
-        rw = wrists["right"]
-        # ==== 在这里多存 2D 像素坐标 ====
-        frame_key = str(idx + 1)  # 和你 JSON 里其它地方一样 1-based
-        if lw is not None:
-            uL, vL = lw
-            wrist2d_L[frame_key] = [float(uL), float(vL)]
-        if rw is not None:
-            uR, vR = rw
-            wrist2d_R[frame_key] = [float(uR), float(vR)]
-
-        # 更新 prev_uL/prev_uR
-        prev_uL = lw if lw is not None else prev_uL
-        prev_uR = rw if rw is not None else prev_uR
-        if wrists is None:
-            # speed_cam[idx] = 0.0
-            # prev_cam = None
-            speed_cam_L[idx] = 0.0
-            speed_cam_R[idx] = 0.0
-            prev_cam_L = None
-            prev_cam_R = None
-            continue
-
-        H, W = depth.shape
-
-
-        # ------- 左手 -------
-        lw = wrists["left"]
-        if lw is not None:
-            uL, vL = lw
-            uiL = min(max(int(uL), 0), W - 1)
-            viL = min(max(int(vL), 0), H - 1)
-            # zL_m = robust_depth_at(
-            #     depth, uiL, viL,
-            #     prev_z=prev_zL,
-            #     win=3,  # 窗口半径3 -> 7x7
-            #     drop_extreme_ratio=0.1,  # 剔除前10%最大+最小
-            #     max_jump=0.1,  # 每帧深度最多跳 20 cm
-            #     debug=True,  # 调试时可以先 True 看打印
-            #     frame_idx=idx,
-            #     hand_side="L"
-            # )
-            # prev_zL = zL_m  # ★ 更新上一帧深度
-            # zL_mm = zL_m * 1000.0
-            # zL_m 已经在上面用 ROI 算好了（单位 m）
-            if zL_m is None:
+    idx = 0
+    while idx < total_frames:
+        batch_frames = []
+        batch_indices = []
+        for _ in range(batch_size):
+            if idx >= total_frames:
+                break
+            ok, frame = cap.read()
+            if not ok:
                 speed_cam_L[idx] = 0.0
-                prev_cam_L = None
-            else:
-                zL_mm = float(zL_m) * 1000.0  # m -> mm（你要求的单位转换）
-
-
-            # print(idx, uL, vL, depth[viL, uiL])
-            #
-            # zL_mm = float(depth[viL, uiL]) * 1000.0
-            XL, YL, ZL = _pixel_to_camera(uL, vL, zL_mm, W, H)
-            cam_track_L[str(idx + 1)] = [float(XL), float(YL), float(ZL)]
-
-            # if prev_cam_L is None:
-            #     spL = 0.0
-            # else:
-            #     dX, dY, dZ = XL - prev_cam_L[0], YL - prev_cam_L[1], ZL - prev_cam_L[2]
-            #     spL = math.sqrt(dX * dX + dY * dY + dZ * dZ)
-            # speed_cam_L[idx] = float(spL)
-            cam_positions_L[idx] = np.array([XL, YL, ZL], dtype=float)
-            prev_cam_L = (XL, YL, ZL)
-
-
-        else:
-            speed_cam_L[idx] = 0.0
-            prev_cam_L = None
-
-        # ------- 右手 -------
-        rw = wrists["right"]
-        if rw is not None:
-            uR, vR = rw
-            uiR = min(max(int(uR), 0), W - 1)
-            viR = min(max(int(vR), 0), H - 1)
-            # zR_m = robust_depth_at(
-            #     depth, uiR, viR,
-            #     prev_z=prev_zR,
-            #     win=3,
-            #     drop_extreme_ratio=0.1,
-            #     max_jump=0.1,
-            #     debug=True,
-            #     frame_idx=idx,
-            #     hand_side="R"
-            # )
-            #
-            # prev_zR = zR_m  # ★ 更新上一帧深度
-            # zR_mm = zR_m * 1000.0
-            if zR_m is None:
                 speed_cam_R[idx] = 0.0
+                prev_cam_L = None
                 prev_cam_R = None
-            else:
-                zR_mm = float(zR_m) * 1000.0  # m -> mm
-            # zR_mm = float(depth[viR, uiR]) * 1000.0
-            XR, YR, ZR = _pixel_to_camera(uR, vR, zR_mm, W, H)
-            cam_track_R[str(idx + 1)] = [float(XR), float(YR), float(ZR)]
+                idx += 1
+                continue
+            batch_frames.append(frame)
+            batch_indices.append(idx)
+            idx += 1
 
-            # if prev_cam_R is None:
-            #     spR = 0.0
-            # else:
-            #     dX, dY, dZ = XR - prev_cam_R[0], YR - prev_cam_R[1], ZR - prev_cam_R[2]
-            #     spR = math.sqrt(dX * dX + dY * dY + dZ * dZ)
-            # speed_cam_R[idx] = float(spR)
-            # prev_cam_R = (XR, YR, ZR)
-            cam_positions_R[idx] = np.array([XR, YR, ZR], dtype=float)
-            prev_cam_R = (XR, YR, ZR)
+        if not batch_frames:
+            continue
 
+        # --- DINO 批量或逐帧 ---
+        if len(batch_frames) > 1 and batch_size > 1:
+            batch_results = get_twohand_boxes_groundingdino_batch(
+                batch_frames,
+                model=_model,
+                load_image_fn=load_image,
+                box_thresh=0.30,
+                text_thresh=0.25,
+                expand_ratio=0.20,
+                prev_box_L=prev_box_L,
+                prev_box_R=prev_box_R,
+            )
         else:
-            speed_cam_R[idx] = 0.0
-            prev_cam_R = None
+            boxL, boxR, prev_box_L, prev_box_R = get_twohand_boxes_groundingdino(
+                batch_frames[0],
+                model=_model,
+                load_image_fn=load_image,
+                predict_fn=predict,
+                box_thresh=0.30,
+                text_thresh=0.25,
+                expand_ratio=0.20,
+                prev_box_L=prev_box_L,
+                prev_box_R=prev_box_R,
+            )
+            batch_results = [(boxL, boxR, prev_box_L, prev_box_R)]
 
-        if (idx+1) % 100 == 0 or idx == total_frames-1:
-            log.info("[3D] Frames %d/%d", idx+1, total_frames)
+        for bi, frame in enumerate(batch_frames):
+            fidx = batch_indices[bi]
+            boxL, boxR, prev_box_L, prev_box_R = batch_results[bi]
+            depth = depths[fidx] if depths is not None else _load_depth(depth_dir, fidx)
+
+            # --- ROI 鲁棒深度（单位：m） ---
+            fh, fw = frame.shape[:2]
+            zL_m = depth_from_hand_roi_meters(depth, boxL, prev_z=prev_zL, frame_H=fh, frame_W=fw) if boxL is not None else None
+            zR_m = depth_from_hand_roi_meters(depth, boxR, prev_z=prev_zR, frame_H=fh, frame_W=fw) if boxR is not None else None
+
+            # 更新上一帧深度（m）
+            prev_zL = zL_m if zL_m is not None else prev_zL
+            prev_zR = zR_m if zR_m is not None else prev_zR
+
+            if depth is None:
+                speed_cam_L[fidx] = 0.0
+                speed_cam_R[fidx] = 0.0
+                prev_cam_L = None
+                prev_cam_R = None
+                continue
+
+            H, W = depth.shape
+            wrists = _wrist_from_frame(frame, depth, cpm, detector=detector, verbose=False)
+            wrists = fix_left_right_identity(wrists, prev_uL, prev_uR)
+            lw = wrists["left"]
+            rw = wrists["right"]
+            # ==== 在这里多存 2D 像素坐标 ====
+            frame_key = str(fidx + 1)  # 和你 JSON 里其它地方一样 1-based
+            if lw is not None:
+                uL, vL = lw
+                wrist2d_L[frame_key] = [float(uL), float(vL)]
+            if rw is not None:
+                uR, vR = rw
+                wrist2d_R[frame_key] = [float(uR), float(vR)]
+
+            # 更新 prev_uL/prev_uR
+            prev_uL = lw if lw is not None else prev_uL
+            prev_uR = rw if rw is not None else prev_uR
+            if wrists is None:
+                speed_cam_L[fidx] = 0.0
+                speed_cam_R[fidx] = 0.0
+                prev_cam_L = None
+                prev_cam_R = None
+                continue
+
+            H, W = depth.shape
+
+            # ------- 左手：depth 有效才算 3D，否则 reset tracking -------
+            cam3d_L = _wrist_to_cam3d_if_valid(lw, zL_m, W, H)
+            if cam3d_L is not None:
+                cam_track_L[str(fidx + 1)] = list(cam3d_L)
+                cam_positions_L[fidx] = np.array(cam3d_L, dtype=float)
+                prev_cam_L = cam3d_L
+            else:
+                prev_cam_L = None
+
+            # ------- 右手：同上 -------
+            cam3d_R = _wrist_to_cam3d_if_valid(rw, zR_m, W, H)
+            if cam3d_R is not None:
+                cam_track_R[str(fidx + 1)] = list(cam3d_R)
+                cam_positions_R[fidx] = np.array(cam3d_R, dtype=float)
+                prev_cam_R = cam3d_R
+            else:
+                prev_cam_R = None
+
+            if (fidx + 1) % 100 == 0 or fidx == total_frames - 1:
+                log.info("[3D] Frames %d/%d", fidx + 1, total_frames)
 
     cap.release()
     speed_cam_L = compute_central_speed(cam_positions_L, total_frames)
@@ -1278,6 +1553,9 @@ def extract_3d_speed_and_visualize(video_path: str, output_dir: str, *, device: 
     #speed_json_path = output_dir / f"{video_name}_with_speed.json"
     speed_json_path = output_dir / f"{video_name}_with_speed_twohands.json"
     _atomic_json_dump(speed_json_path, speed_pairs)
+
+    # 6.5) 速度自检与统计
+    _check_and_log_speed_stats(video_name, speed_pairs, total_frames)
 
     plt.figure(figsize=(12, 4))
     xs = [p[0] for p in speed_pairs]

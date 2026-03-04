@@ -38,6 +38,9 @@ _model = load_model(
     "/home/EgoLoc/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"  # 直接放在weights目录外
 )
 
+# 速度 JSON 根目录；由 --speed_root 设置时覆盖 get_json_path / get_json_folder_path 及 extract_* 的 folder_path
+_SPEED_BASE_DIR = None
+
 
 def run_groundingdino_and_crop(
         image: np.ndarray,
@@ -171,6 +174,8 @@ def enforce_min_distance(indices, min_dist, reference_values):
 
 
 def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3D_speed_VDA"):
+    if _SPEED_BASE_DIR is not None:
+        folder_path = os.path.join(_SPEED_BASE_DIR, video_path)
     thresh = 0.08  # 异常值阈值
     savgol_polyorder = 2  # 提高多项式阶数以更好拟合曲线
     spline_s = 1e-4  # 增大样条平滑因子抑制噪声
@@ -261,8 +266,9 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
 
 
 def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3D_hand_speed"):
-    # 返回速度从慢到快的极小值点列表
-    thresh = 1  # 异常值阈值
+    if _SPEED_BASE_DIR is not None:
+        folder_path = os.path.join(_SPEED_BASE_DIR, video_path)
+    # 返回速度从慢到快的极小值点列表；量纲不敏感：只保留有效正值，用 q95 截断极端大值
     savgol_polyorder = 2  # Savitzky-Golay 多项式阶数
     spline_s = 1e-4  # 样条插值平滑因子
     savgol_mode = 'nearest'  # 滤波模式
@@ -285,14 +291,21 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
         print(f"❗ 数据为空: {file_path}")
         return []
 
-    filtered_data = [
-        (frame, speed)
-        for frame, speed in data
-        if isinstance(speed, (int, float)) and not np.isnan(speed) and 0 < speed < thresh]
-
-    if len(filtered_data) < 4:
-        print(f"⚠️ 视频 {video_id} 数据点太少（{len(filtered_data)}），跳过！")
+    # 稳健过滤：先安全转 float，再用 isfinite 避免 None/np.ndarray/np.float32 等踩雷
+    valid_data = []
+    for frame, speed in data:
+        try:
+            s = float(speed)
+            if math.isfinite(s) and s > 0:
+                valid_data.append((frame, s))
+        except (TypeError, ValueError):
+            continue
+    if len(valid_data) < 4:
+        print(f"⚠️ 视频 {video_id} 数据点太少（{len(valid_data)}），跳过！")
         return []
+    speeds_arr = np.array([s for _, s in valid_data])
+    q95 = float(np.percentile(speeds_arr, 95))
+    filtered_data = [(f, min(s, q95)) for f, s in valid_data]
 
     frames, speeds = zip(*filtered_data)
     data_len = len(speeds)
@@ -411,6 +424,8 @@ def extract_local_minima_frames_adaptive(
     自适应版：根据总帧数和速度自动设置四个关键参数并提取极小值帧。
     返回：极小值帧list、极小值帧对应速度list
     """
+    if _SPEED_BASE_DIR is not None:
+        folder_path = os.path.join(_SPEED_BASE_DIR, video_path)
     json_file = os.path.join(folder_path, f"{video_path}_with_speed.json")
     if not os.path.isfile(json_file):
         print(f"❗ 文件未找到: {json_file}")
@@ -610,6 +625,8 @@ def select_and_filter_keyframes_with_anchor(selected_indices, total_indices, gri
 
 # def get_json_path(video_name, base_dir="/home/hand/3D_hand_speed"):
 def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/3D_hand_right"):
+    if _SPEED_BASE_DIR is not None:
+        base_dir = _SPEED_BASE_DIR
     # json_filename = f"{video_name}_with_speed.json"
     # json_path = os.path.join(base_dir, json_filename)
     # return json_path
@@ -624,6 +641,8 @@ def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/3D_hand_ri
 
 
 def get_json_folder_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/3D_hand_right"):
+    if _SPEED_BASE_DIR is not None:
+        base_dir = _SPEED_BASE_DIR
     # json_filename = f"{video_name}_with_speed.json"
     # json_path = os.path.join(base_dir, json_filename)
     # return json_path
@@ -1528,6 +1547,7 @@ parser.add_argument(
     default="grabbing towards the can")
 parser.add_argument('--keyframe_sampling_mode', type=str, default='adaptive', choices=['adaptive', 'random'],
                     help='关键帧索引采样方式: adaptive(速度加权) or random(等概率)')
+parser.add_argument('--speed_root', type=str, default=None, help='速度 JSON 根目录，设置后覆盖 get_json_path 与 extract_* 的 folder_path')
 pargs, unknown = parser.parse_known_args()
 credentials = dotenv.dotenv_values(pargs.credentials)
 required_keys = ["OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"]
@@ -1542,6 +1562,8 @@ folder_name = action.replace(" ", "_")
 output_folder = f"results/{folder_name}"
 # os.makedirs(output_folder, exist_ok=True)
 if __name__ == "__main__":
+    if pargs.speed_root is not None:
+        _SPEED_BASE_DIR = pargs.speed_root  # 覆盖模块级变量，供 get_json_* 与 extract_* 使用
     # 获取文件夹中的所有 MP4 文件并按顺序排序
     video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
     save_path = "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"

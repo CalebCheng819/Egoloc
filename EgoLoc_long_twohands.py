@@ -20,6 +20,7 @@ from scipy.signal import savgol_filter, find_peaks
 from scipy.interpolate import UnivariateSpline
 import re
 from pathlib import Path
+from datetime import datetime
 
 sys.path.append('/home/Egoloc/Egolocx')  # 将 /home 路径添加到模块搜索路径中
 sys.path.append('/home/Egoloc')
@@ -37,6 +38,12 @@ _model = load_model(
     "/home/EgoLoc/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
     "/home/EgoLoc/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"  # 直接放在weights目录外
 )
+
+# 速度 JSON 根目录；由 --speed_root 设置时覆盖 get_json_path / get_json_folder_path 及 extract_* 的 folder_path
+_SPEED_BASE_DIR = None
+# 输出根目录；由 --output_dir 指定或自动生成（日期+配置），所有预测/缓存/调试写入其下
+_OUTPUT_ROOT = None
+
 
 def _load_speed_scalar(json_path: str, hand: str = "right"):
     """
@@ -283,6 +290,8 @@ def enforce_min_distance(indices, min_dist, reference_values):
 
 
 def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3D_speed_VDA"):
+    if _SPEED_BASE_DIR is not None:
+        folder_path = os.path.join(_SPEED_BASE_DIR, video_path)
     thresh = 0.08  # 异常值阈值
     savgol_polyorder = 2  # 提高多项式阶数以更好拟合曲线
     spline_s = 1e-4  # 增大样条平滑因子抑制噪声
@@ -373,6 +382,8 @@ def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3
 
 
 def extract_local_minima_frames(video_path, folder_path="/home/bathroomCabinet/3D_hand_speed"):
+    if _SPEED_BASE_DIR is not None:
+        folder_path = os.path.join(_SPEED_BASE_DIR, video_path)
     # 返回速度从慢到快的极小值点列表
     thresh = 1  # 异常值阈值
     savgol_polyorder = 2  # Savitzky-Golay 多项式阶数
@@ -547,6 +558,8 @@ def extract_local_minima_frames_adaptive(
         result: 极小值帧号列表（以你 JSON 里的 frame index 为准，一般是 0-based）
         result_speeds: 对应帧的速度
     """
+    if _SPEED_BASE_DIR is not None:
+        folder_path = os.path.join(_SPEED_BASE_DIR, os.path.splitext(os.path.basename(video_path))[0])
 
     # -------- 0. 解析 video_stem + JSON 路径 --------
     video_basename = os.path.basename(video_path)
@@ -955,6 +968,8 @@ def select_and_filter_keyframes_with_anchor(selected_indices, total_indices, gri
 
 # def get_json_path(video_name, base_dir="/home/hand/3D_hand_speed"):
 def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/ego4d_mp4_outputs"):
+    if _SPEED_BASE_DIR is not None:
+        base_dir = _SPEED_BASE_DIR
     # json_filename = f"{video_name}_with_speed.json"
     # json_path = os.path.join(base_dir, json_filename)
     # return json_path
@@ -970,6 +985,8 @@ def get_json_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/ego4d_mp4_
 
 
 def get_json_folder_path(video_name, base_dir="/home/EgoLoc/hand_data_drawer/mp4_outputs_sorted_test4"):
+    if _SPEED_BASE_DIR is not None:
+        base_dir = _SPEED_BASE_DIR
     # json_filename = f"{video_name}_with_speed.json"
     # json_path = os.path.join(base_dir, json_filename)
     # return json_path
@@ -2070,13 +2087,8 @@ def vlm_referee_all_contacts_for_separation(
         from PIL import Image
         rgb = cv2.cvtColor(grid_bgr, cv2.COLOR_BGR2RGB)
         from pathlib import Path
-
-        debug_dir = Path("/home/EgoLoc/debug_referee")
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
-        debug_save_path = debug_dir / f"referee_S{separation_frame}.png"
-        Image.fromarray(rgb).save(debug_save_path)
-
+        p = Path(debug_save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(rgb).save(debug_save_path)
 
     # -------- prompt --------
@@ -2914,7 +2926,10 @@ def process_task(
     # Iterate to narrow down the time
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     # 建一个按视频名分组的调试图目录,方便保存图片
-    debug_dir = Path("/home/EgoLoc/hand_data_drawer/debug_grids") / video_name
+    if _OUTPUT_ROOT:
+        debug_dir = Path(_OUTPUT_ROOT) / "debug_grids" / video_name
+    else:
+        debug_dir = Path("/home/EgoLoc/hand_data_drawer/debug_grids") / video_name
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     json_path = get_json_path(video_name)
@@ -2929,7 +2944,12 @@ def process_task(
     all_speeds = np.array([x[1] for x in scalar_data])
 
     if video_type == "short":
-        minima_indices = extract_local_minima_frames(video_name, json_folder_path, hand=hand)
+        # minima_indices = extract_local_minima_frames(video_name, json_folder_path, hand=hand)
+        minima_indices, _ = extract_local_minima_frames_adaptive(
+            video_name,
+            folder_path=json_folder_path,
+            hand=hand,
+        )        
         minima_speeds = [
             all_speeds[np.where(all_frames == idx)[0][0]]
             for idx in minima_indices if np.any(all_frames == idx)
@@ -3251,6 +3271,7 @@ def convert_video(video_file_path: str, action: str, credentials, grid_size: int
     # )
     speed_data = _load_speed_scalar(str(json_path), hand=hand)
 
+    _referee_debug = (Path(_OUTPUT_ROOT) / "debug_referee") if _OUTPUT_ROOT else Path("/home/EgoLoc/debug_referee")
     pair = level3_pairing(
         results=results,
         video_path=video_file_path,
@@ -3259,7 +3280,7 @@ def convert_video(video_file_path: str, action: str, credentials, grid_size: int
         matching_cfg={"w_speed": 2.0},  # NEW (示例权重)
         max_candidates_per_query=12,
         max_rounds=3,
-        debug_dir=Path("/home/EgoLoc/debug_referee"),
+        debug_dir=_referee_debug,
     )
 
     return pair
@@ -3275,6 +3296,9 @@ parser.add_argument(
     default="grabbing towards the can")
 parser.add_argument('--keyframe_sampling_mode', type=str, default='adaptive', choices=['adaptive', 'random'],
                     help='关键帧索引采样方式: adaptive(速度加权) or random(等概率)')
+parser.add_argument('--speed_root', type=str, default=None, help='速度 JSON 根目录，设置后覆盖 get_json_path 与 extract_* 的 folder_path')
+parser.add_argument('--output_dir', type=str, default=None, help='本次运行输出根目录；未指定时自动生成 output/egoloc_<date>_<time>_<video_type>_grid<N>_<folder>')
+parser.add_argument('--video_folder', type=str, default=None, help='视频所在目录（用于列表与输出目录命名）')
 pargs, unknown = parser.parse_known_args()
 credentials = dotenv.dotenv_values(pargs.credentials)
 required_keys = ["OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"]
@@ -3282,13 +3306,40 @@ if not all(key in credentials for key in required_keys):
     raise ValueError("Required keys are missing in the credentials file")
 render_pos = 'topright'  # center or topright
 grid_size = int(pargs.grid)
-video_folder = "/home/EgoLoc/hand_data_drawer/ego4dvideo"
+video_folder = pargs.video_folder or "/home/EgoLoc/hand_data_drawer/ego4dvideo"
 action = pargs.action
 video_type = pargs.video_type
 folder_name = action.replace(" ", "_")
 output_folder = f"results/{folder_name}"
 # os.makedirs(output_folder, exist_ok=True)
 if __name__ == "__main__":
+    if pargs.speed_root is not None:
+        _SPEED_BASE_DIR = pargs.speed_root  # 覆盖模块级变量，供 get_json_* 与 extract_* 使用
+    # 构建输出根目录：显式指定或按日期+配置自动生成
+    if pargs.output_dir:
+        _OUTPUT_ROOT = pargs.output_dir
+    else:
+        basename = os.path.basename(video_folder.rstrip(os.sep))
+        _OUTPUT_ROOT = "output/egoloc_{}_{}_grid{}_{}".format(
+            datetime.now().strftime("%Y-%m-%d_%H%M"),
+            video_type,
+            grid_size,
+            basename,
+        )
+    os.makedirs(_OUTPUT_ROOT, exist_ok=True)
+    meta = {
+        "video_folder": video_folder,
+        "speed_root": _SPEED_BASE_DIR,
+        "video_type": video_type,
+        "grid_size": grid_size,
+        "action": action,
+        "output_root": _OUTPUT_ROOT,
+        "timestamp": datetime.now().isoformat(),
+    }
+    with open(os.path.join(_OUTPUT_ROOT, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    print("Output root:", _OUTPUT_ROOT)
+
     minima_cache = {
         "left": {},  # video.mp4 -> [frame, frame, ...]
         "right": {}
@@ -3308,11 +3359,11 @@ if __name__ == "__main__":
     for hand in ["left", "right"]:
         print(f"\n====== 处理 {hand} 手 ======\n")
 
-        # 每只手一份结果文件
-        if hand == "right":
-            save_path = "/home/EgoLoc/ManiTIL_prompt/r16.json"
+        # 每只手一份结果文件（自适应输出时使用可读文件名）
+        if _OUTPUT_ROOT:
+            save_path = os.path.join(_OUTPUT_ROOT, "predictions_right.json" if hand == "right" else "predictions_left.json")
         else:
-            save_path = "/home/EgoLoc/ManiTIL_prompt/l16.json"
+            save_path = "/home/EgoLoc/ManiTIL_prompt/r16.json" if hand == "right" else "/home/EgoLoc/ManiTIL_prompt/l16.json"
 
         all_predictions = load_predictions(save_path)
         processed_video_files = {prediction[0] for prediction in all_predictions}
@@ -3339,10 +3390,15 @@ if __name__ == "__main__":
                 list_of_pair.append(pair)
 
             averaged_pairs = calculate_max_mode_average(list_of_pair)
-            with open("/home/EgoLoc/ManiTIL_prompt/minima_left_16.json", "w") as f:
+            if _OUTPUT_ROOT:
+                minima_left_path = os.path.join(_OUTPUT_ROOT, "minima_left.json")
+                minima_right_path = os.path.join(_OUTPUT_ROOT, "minima_right.json")
+            else:
+                minima_left_path = "/home/EgoLoc/ManiTIL_prompt/minima_left_16.json"
+                minima_right_path = "/home/EgoLoc/ManiTIL_prompt/minima_right_16.json"
+            with open(minima_left_path, "w") as f:
                 json.dump(minima_cache["left"], f, indent=2)
-
-            with open("/home/EgoLoc/ManiTIL_prompt/minima_right_16.json", "w") as f:
+            with open(minima_right_path, "w") as f:
                 json.dump(minima_cache["right"], f, indent=2)
             if len(averaged_pairs) == 0:
                 print(f"{video_file} ({hand}) can't predict")
@@ -3365,23 +3421,29 @@ if __name__ == "__main__":
         elif video_type == "long":
             gt_json = "/home/EgoLoc/hand_data_drawer/ego4dvideo/result.json"
 
-            pred_left = "/home/EgoLoc/ManiTIL_prompt/l16.json"
-            pred_right = "/home/EgoLoc/ManiTIL_prompt/r16.json"
+            if _OUTPUT_ROOT:
+                pred_left = os.path.join(_OUTPUT_ROOT, "predictions_left.json")
+                pred_right = os.path.join(_OUTPUT_ROOT, "predictions_right.json")
+                minima_left_path = os.path.join(_OUTPUT_ROOT, "minima_left.json")
+                minima_right_path = os.path.join(_OUTPUT_ROOT, "minima_right.json")
+            else:
+                pred_left = "/home/EgoLoc/ManiTIL_prompt/l16.json"
+                pred_right = "/home/EgoLoc/ManiTIL_prompt/r16.json"
+                minima_left_path = "/home/EgoLoc/ManiTIL_prompt/minima_left_16.json"
+                minima_right_path = "/home/EgoLoc/ManiTIL_prompt/minima_right_16.json"
 
             results_left = evaluate_all_stages(
                 pred_json_path=pred_left,
                 gt_json_path=gt_json,
                 hand="left",
-
-                minima_json_path="/home/EgoLoc/ManiTIL_prompt/minima_left_16.json"
+                minima_json_path=minima_left_path,
             )
 
             results_right = evaluate_all_stages(
                 pred_json_path=pred_right,
                 gt_json_path=gt_json,
                 hand="right",
-
-                minima_json_path="/home/EgoLoc/ManiTIL_prompt/minima_right_16.json"
+                minima_json_path=minima_right_path,
             )
 
             print("\nEvaluation (left):")
