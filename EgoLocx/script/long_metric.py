@@ -531,13 +531,21 @@ def evaluate_all(
     gt_json,
     hand="right",
     sr_tolerances=(1,3,5),
-    psr_tolerance=6
+    psr_tolerance=6,
+    videos_to_exclude=None,
 ):
+    """
+    videos_to_exclude: 不纳入计算的视频 key 集合（如 GT 左右手都为空的视频）。
+    """
     preds = load_predictions(pred_json)
     gts = load_ground_truth_json_twohands(gt_json, hand=hand)
+    if videos_to_exclude is None:
+        videos_to_exclude = set()
 
     all_metrics = []
     for video_key, gt_info in gts.items():
+        if video_key in videos_to_exclude:
+            continue
         pred_pairs = preds.get(video_key, [])
         gt_pairs = gt_info["pairs"]
         total_frames = gt_info["total_frames"]
@@ -549,25 +557,93 @@ def evaluate_all(
         )
         all_metrics.append(metrics)
 
+    if not all_metrics:
+        return {k: None for k in ["SR@1", "SR@3", "SR@5", "PSR", "mae", "MoF", "IoU"]}
     final = {}
     for key in all_metrics[0].keys():
         vals = [m[key] for m in all_metrics if m[key] is not None]
         final[key] = np.mean(vals) if vals else None
     return final
+
+
+def evaluate_all_stages_pooled_twohands(
+    pred_left_path,
+    pred_right_path,
+    gt_json_path,
+    sr_tolerances=(1, 3, 5),
+    psr_tolerance=10,
+):
+    """
+    左右手一起评估（按接触对合并）：不采用 (left_metric + right_metric) / 2，
+    而是把每个 (video, hand) 当作一个样本，逐样本算 stage3 指标后对全体样本求平均，
+    等价于按左右手贡献的接触对数量自然加权。
+    - 仅对「该手标注非空」的 (video, hand) 纳入：若某视频左手/右手标注为空（如 "left": []），则该手不纳入计算，预测也不计入。
+    返回: {"hand": "both", "stage3": {SR@1, SR@3, SR@5, PSR, mae, MoF, IoU}}
+    """
+    preds_left = load_predictions(pred_left_path)
+    preds_right = load_predictions(pred_right_path)
+    gts_left = load_ground_truth_json_twohands(gt_json_path, hand="left")
+    gts_right = load_ground_truth_json_twohands(gt_json_path, hand="right")
+
+    all_videos = set(gts_left.keys()) | set(gts_right.keys()) | set(preds_left.keys()) | set(preds_right.keys())
+    samples = []  # list of (gt_pairs, pred_pairs, total_frames)
+
+    for video in all_videos:
+        total = None
+        if video in gts_left:
+            total = gts_left[video].get("total_frames")
+        if total is None and video in gts_right:
+            total = gts_right[video].get("total_frames")
+        if total is None:
+            continue
+
+        gt_l = gts_left.get(video, {}).get("pairs", [])
+        pred_l = preds_left.get(video, [])
+        gt_r = gts_right.get(video, {}).get("pairs", [])
+        pred_r = preds_right.get(video, [])
+
+        # 仅当该手标注非空时才加入样本（标注为空则该手不纳入，包括预测也不计入）
+        if gt_l:
+            samples.append((gt_l, pred_l, total))
+        if gt_r:
+            samples.append((gt_r, pred_r, total))
+
+    if not samples:
+        keys = ["SR@1", "SR@3", "SR@5", "PSR", "mae", "MoF", "IoU"]
+        return {"hand": "both", "stage3": {k: None for k in keys}}
+
+    all_metrics = []
+    for gt_pairs, pred_pairs, total_frames in samples:
+        m = evaluate_video(
+            gt_pairs, pred_pairs, total_frames,
+            sr_tolerances=sr_tolerances,
+            psr_tolerance=psr_tolerance,
+        )
+        all_metrics.append(m)
+
+    final = {}
+    for key in all_metrics[0].keys():
+        vals = [m[key] for m in all_metrics if m[key] is not None]
+        final[key] = float(np.mean(vals)) if vals else None
+    return {"hand": "both", "stage3": final}
+
+
 def evaluate_all_stages(
     pred_json_path,
     gt_json_path,
     hand,
     minima_json_path=None,
     tol=5,
+    videos_to_exclude=None,
 ):
-    # Stage-3：保持你原 evaluate_all 的调用方式
+    # Stage-3：保持你原 evaluate_all 的调用方式；可排除 GT 左右手都为空的视频
     stage3 = evaluate_all(
         pred_json=pred_json_path,
         gt_json=gt_json_path,
         hand=hand,
         sr_tolerances=(1,3,5),
         psr_tolerance=10,
+        videos_to_exclude=videos_to_exclude,
     )
 
     out = {"hand": hand, "stage3": stage3}

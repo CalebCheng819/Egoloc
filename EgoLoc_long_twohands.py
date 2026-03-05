@@ -15,6 +15,7 @@ import argparse
 import openai
 import pandas as pd
 import sys
+import subprocess
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter, find_peaks
 from scipy.interpolate import UnivariateSpline
@@ -26,18 +27,33 @@ sys.path.append('/home/Egoloc/Egolocx')  # 将 /home 路径添加到模块搜索
 sys.path.append('/home/Egoloc')
 sys.path.append('/home/EgoLoc/Grounded-Segment-Anything/GroundingDINO')  # 必需
 from groundingdino.util.inference import load_model, load_image, predict
-from EgoLocx.script.long_metric import evaluate_all,evaluate_all_stages
+from EgoLocx.script.long_metric import (
+    evaluate_all,
+    evaluate_all_stages,
+    evaluate_all_stages_pooled_twohands,
+    load_ground_truth_json_twohands,
+)
 from EgoLocx.script.compute_metric import evaluate_predictions
 import tempfile
 from egoloc_speed_twohands import extract_3d_speed_and_visualize  # 新封装的生成速度文件的函数
 from egoloc_speed_twohands import batch_process_videos  # 对文件夹内的所有视频执行extract_3d_speed_and_visualize
 from typing import List, Optional   # ← 新增这一行
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
-_model = load_model(
-    "/home/EgoLoc/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
-    "/home/EgoLoc/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"  # 直接放在weights目录外
-)
+# 模型惰性加载，便于多 GPU 时子进程在各自 GPU 上加载
+_model = None
+# 主进程的 minima_cache 引用，供 process_task 在未传入 minima_cache 时使用
+_MINIMA_CACHE_REF = None
+
+
+def get_model():
+    """首次调用时加载 GroundingDINO，之后返回已加载的模型（便于多 GPU 子进程各自加载）。"""
+    global _model
+    if _model is None:
+        _model = load_model(
+            "/home/EgoLoc/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+            "/home/EgoLoc/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"  # 直接放在weights目录外
+        )
+    return _model
 
 # 速度 JSON 根目录；由 --speed_root 设置时覆盖 get_json_path / get_json_folder_path 及 extract_* 的 folder_path
 _SPEED_BASE_DIR = None
@@ -168,7 +184,7 @@ def run_groundingdino_and_crop_stable(
 
     # 2) 一次性检测所有 hand（不要用 left/right prompt）
     boxes_norm, logits, phrases = predict(
-        model=_model,
+        model=get_model(),
         image=tensor_img,
         caption=text_prompt,
         box_threshold=box_thresh,
@@ -2916,8 +2932,13 @@ def process_task(
         keyframe_sampling_mode="adaptive",
         use_feedback=True,
         hand="right",      # ⭐ 新增
+        anchors_cache=None,
+        minima_cache=None,  # 多 GPU worker 时传入本地 dict，主进程用 _MINIMA_CACHE_REF
 ):
     """Process a task to identify the start or end of an action in a video."""
+    global _MINIMA_CACHE_REF
+    cache = minima_cache if minima_cache is not None else _MINIMA_CACHE_REF
+    state_list = []  # 本视频本手每次极小值触发的 state
 
     # prompt_contact, prompt_separation, prompt_state, fb_contact, fb_separation = build_prompts(hand)
     prompt_contact, prompt_separation, prompt_state, fb_contact, fb_separation, fb_score_contact, fb_score_separation = build_prompts(
@@ -2938,7 +2959,7 @@ def process_task(
     scalar_data = _load_speed_scalar(str(json_path), hand=hand)
     if not scalar_data:
         print(f"[process_task] {video_name}, hand={hand} 没有有效速度数据")
-        return []
+        return [], state_list
 
     all_frames = np.array([x[0] for x in scalar_data])
     all_speeds = np.array([x[1] for x in scalar_data])
@@ -2964,11 +2985,33 @@ def process_task(
     # 去重 + 排序，防止采样过程影响原始 minima
     clean_minima = sorted(set(int(x) for x in minima_indices))
 
-    # 写入全局缓存（注意：不要覆盖已有的）
-    if video_key not in minima_cache[hand]:
-        minima_cache[hand][video_key] = clean_minima
+    # 融合锚点：锚点不筛选，全部进入后续 VLM 判断
+    if anchors_cache is None:
+        anchors_cache = {}
+    combined_frames = list(clean_minima)
+    anchor_key = f"{video_name}_{hand}"
+    anchors_raw = anchors_cache.get(anchor_key, {}).get("merged", [])
+    if anchors_raw:
+        anchors_in_range = [int(f) for f in anchors_raw if 0 <= int(f) < total_frames]
+        combined_frames = sorted(set(anchors_in_range) | set(clean_minima))
 
-    print(f"{video_name}获取的极小值列表为:{minima_indices}")
+    # 为 combined_frames 构造 minima_indices（可 pop）与 minima_speeds（与 while 循环兼容）
+    minima_indices = list(combined_frames)
+    fallback_speed = float(np.median(all_speeds)) if len(all_speeds) > 0 else 0.0
+    minima_speeds = []
+    for f in combined_frames:
+        idx_in_all = np.where(all_frames == f)[0]
+        if len(idx_in_all) > 0:
+            minima_speeds.append(float(all_speeds[idx_in_all[0]]))
+        else:
+            nearest_idx = np.argmin(np.abs(all_frames - f))
+            minima_speeds.append(float(all_speeds[nearest_idx]) if len(all_frames) > 0 else fallback_speed)
+
+    # 写入全局缓存（融合后候选帧，含锚点 + 速度极小值）
+    if cache is not None:
+        cache.setdefault(hand, {})[video_key] = list(combined_frames)
+
+    print(f"{video_name} 融合后候选帧（锚点+极小值）共 {len(combined_frames)} 个: {combined_frames}")
     selected_frame_index = []
     while minima_indices:
         # 速度越小概率越高采样极小值点
@@ -3202,6 +3245,18 @@ def load_json_safe(path, default):
     with open(path, "r") as f:
         return json.load(f)
 
+
+def load_anchors_cache(anchors_path):
+    """
+    加载锚点缓存 JSON。key 为 "video_stem_left" / "video_stem_right"，
+    value 为 {"merged": [...], "speed": [...], "visual": [...]}。
+    若路径为 None 或文件不存在则返回 {}。
+    """
+    if anchors_path is None or not os.path.exists(anchors_path):
+        return {}
+    with open(anchors_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -3242,11 +3297,13 @@ def calculate_max_mode_average(list_of_pairs_lists):
     return averaged_pairs
 
 
-def convert_video(video_file_path: str, action: str, credentials, grid_size: int, video_type="short", max_feedback=1,hand="right"):
+def convert_video(video_file_path: str, action: str, credentials, grid_size: int, video_type="short", max_feedback=1, hand="right", anchors_cache=None, minima_cache=None):
+    if anchors_cache is None:
+        anchors_cache = {}
     video = cv2.VideoCapture(video_file_path)
     fps = video.get(cv2.CAP_PROP_FPS)
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    results,state_list= process_task(
+    results, state_list = process_task(
         credentials,
         video_file_path,
         grid_size,
@@ -3254,6 +3311,8 @@ def convert_video(video_file_path: str, action: str, credentials, grid_size: int
         max_feedback=max_feedback,
         video_type=video_type,
         hand=hand,
+        anchors_cache=anchors_cache,
+        minima_cache=minima_cache,
     )
     # print(results)
     video_name = os.path.splitext(os.path.basename(video_file_path))[0]
@@ -3299,6 +3358,14 @@ parser.add_argument('--keyframe_sampling_mode', type=str, default='adaptive', ch
 parser.add_argument('--speed_root', type=str, default=None, help='速度 JSON 根目录，设置后覆盖 get_json_path 与 extract_* 的 folder_path')
 parser.add_argument('--output_dir', type=str, default=None, help='本次运行输出根目录；未指定时自动生成 output/egoloc_<date>_<time>_<video_type>_grid<N>_<folder>')
 parser.add_argument('--video_folder', type=str, default=None, help='视频所在目录（用于列表与输出目录命名）')
+parser.add_argument('--anchors_path', type=str, default=None,
+                    help='锚点缓存 JSON 路径，例如 .../short/merged_anchors_cache.json；若提供则与速度极小值合并作为候选帧，锚点不筛选全部进入 VLM 判断')
+parser.add_argument('--gpus', type=str, default=None,
+                    help='多 GPU 并行：逗号分隔的 GPU ID，如 "0,1,2,3"；不传或单卡时使用默认 GPU 0')
+parser.add_argument('--worker_tasks', type=str, default=None,
+                    help='[内部] Worker 模式：任务 JSON 路径，处理指定任务并写入 worker_output_dir')
+parser.add_argument('--worker_output_dir', type=str, default=None,
+                    help='[内部] Worker 模式：本进程输出目录')
 pargs, unknown = parser.parse_known_args()
 credentials = dotenv.dotenv_values(pargs.credentials)
 required_keys = ["OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"]
@@ -3313,6 +3380,52 @@ folder_name = action.replace(" ", "_")
 output_folder = f"results/{folder_name}"
 # os.makedirs(output_folder, exist_ok=True)
 if __name__ == "__main__":
+    # ---------- Worker 模式：子进程处理指定任务，写入 worker_output_dir ----------
+    if getattr(pargs, "worker_tasks", None) and getattr(pargs, "worker_output_dir", None):
+        with open(pargs.worker_tasks, "r", encoding="utf-8") as f:
+            worker_cfg = json.load(f)
+        _SPEED_BASE_DIR = worker_cfg.get("speed_root")
+        _OUTPUT_ROOT = pargs.worker_output_dir
+        os.makedirs(_OUTPUT_ROOT, exist_ok=True)
+        video_folder = worker_cfg["video_folder"]
+        credentials = dotenv.dotenv_values(worker_cfg["credentials_path"])
+        action = worker_cfg["action"]
+        grid_size = int(worker_cfg["grid_size"])
+        video_type = worker_cfg.get("video_type", "short")
+        anchors_cache = load_anchors_cache(worker_cfg.get("anchors_path")) or {}
+        minima_cache = {"left": {}, "right": {}}
+        tasks = worker_cfg["tasks"]
+        pred_left, pred_right = [], []
+        for t in tasks:
+            hand, video_file = t["hand"], t["video_file"]
+            video_path = os.path.join(video_folder, video_file)
+            if not os.path.exists(video_path):
+                continue
+            pair = convert_video(
+                video_path, action, credentials, grid_size,
+                video_type=video_type, max_feedback=3, hand=hand,
+                anchors_cache=anchors_cache, minima_cache=minima_cache,
+            )
+            if hand == "left":
+                pred_left.append([video_file, pair])
+            else:
+                pred_right.append([video_file, pair])
+        save_predictions(pred_left, os.path.join(_OUTPUT_ROOT, "predictions_left.json"))
+        save_predictions(pred_right, os.path.join(_OUTPUT_ROOT, "predictions_right.json"))
+        with open(os.path.join(_OUTPUT_ROOT, "minima_left.json"), "w") as f:
+            json.dump(minima_cache.get("left", {}), f, indent=2)
+        with open(os.path.join(_OUTPUT_ROOT, "minima_right.json"), "w") as f:
+            json.dump(minima_cache.get("right", {}), f, indent=2)
+        sys.exit(0)
+
+    # ---------- 主进程：设置 GPU 与输出目录 ----------
+    gpus_str = getattr(pargs, "gpus", None)
+    if gpus_str:
+        gpu_list = [x.strip() for x in gpus_str.split(",") if x.strip()]
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list[0] if len(gpu_list) == 1 else gpus_str
+    else:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
     if pargs.speed_root is not None:
         _SPEED_BASE_DIR = pargs.speed_root  # 覆盖模块级变量，供 get_json_* 与 extract_* 使用
     # 构建输出根目录：显式指定或按日期+配置自动生成
@@ -3344,73 +3457,162 @@ if __name__ == "__main__":
         "left": {},  # video.mp4 -> [frame, frame, ...]
         "right": {}
     }
+    _MINIMA_CACHE_REF = minima_cache
+    anchors_cache = load_anchors_cache(pargs.anchors_path) if getattr(pargs, "anchors_path", None) else {}
+    if anchors_cache:
+        print(f"已加载锚点缓存，共 {len(anchors_cache)} 条（video_stem_hand）")
     state_list = []  # ✅ 记录本视频本手，每次极小值触发的 state
     # 获取文件夹中的所有 MP4 文件并按顺序排序
     video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
     # save_path = "/home/EgoLoc/ManiTIL_prompt/right_grid4.json"
     speed_output_root = "/home/EgoLoc/hand_data_drawer/ego4d_mp4_outputs"
     # save_path = "/home/VLM-Video-Action-Localization-main/VLM-Video-Action-Localization-main/result/greedyVLM_drawer_grid5.json"
-    # 排序视频文件，基于文件名中 'c' 后的数字部分
-    sorted_video_files = sorted(video_files, key=lambda x: int(x.split('.')[0][5:]))
-    # all_predictions = load_predictions(save_path)
-    #batch_process_videos(video_folder, speed_output_root, device="cuda", encoder="vits")  # 后续添加对已有文件的跳过
-    # processed_video_files = {prediction[0] for prediction in all_predictions}
+    # 排序视频文件，基于文件名中 'c' 后的数字部分（videoN 格式）；其他格式按文件名
+    def _video_sort_key(x):
+        try:
+            return int(x.split('.')[0][5:])
+        except (ValueError, IndexError):
+            return x
+    sorted_video_files = sorted(video_files, key=_video_sort_key)
 
-    for hand in ["left", "right"]:
-        print(f"\n====== 处理 {hand} 手 ======\n")
-
-        # 每只手一份结果文件（自适应输出时使用可读文件名）
-        if _OUTPUT_ROOT:
+    # ---------- 多 GPU：分配任务并启动子进程，再合并结果 ----------
+    gpu_list = [x.strip() for x in (gpus_str or "").split(",") if x.strip()] if gpus_str else []
+    if len(gpu_list) > 1:
+        # 构建 (hand, video_file) 任务列表（只含未处理的）
+        tasks = []
+        for hand in ["left", "right"]:
             save_path = os.path.join(_OUTPUT_ROOT, "predictions_right.json" if hand == "right" else "predictions_left.json")
+            existing = load_predictions(save_path)
+            processed = {p[0] for p in existing}
+            for video_file in sorted_video_files:
+                if video_file in processed:
+                    continue
+                tasks.append({"hand": hand, "video_file": video_file})
+        if not tasks:
+            print("没有待处理任务（可能已全部完成）。")
         else:
-            save_path = "/home/EgoLoc/ManiTIL_prompt/r16.json" if hand == "right" else "/home/EgoLoc/ManiTIL_prompt/l16.json"
-
-        all_predictions = load_predictions(save_path)
-        processed_video_files = {prediction[0] for prediction in all_predictions}
-
-        for video_file in sorted_video_files:
-            if video_file in processed_video_files:
-                continue
-
-            video_path = os.path.join(video_folder, video_file)
-            if not os.path.exists(video_path):
-                continue
-
-            list_of_pair = []
-            for i in range(1):
-                pair = convert_video(
-                    video_path,
-                    action,
-                    credentials,
-                    grid_size,
-                    video_type=video_type,
-                    max_feedback=3,
-                    hand=hand,  # ⭐ 关键：这一轮是 hand
+            n_workers = min(len(gpu_list), len(tasks))
+            chunk_size = (len(tasks) + n_workers - 1) // n_workers
+            chunks = [tasks[i:i + chunk_size] for i in range(0, len(tasks), chunk_size)]
+            worker_cfg_base = {
+                "video_folder": video_folder,
+                "speed_root": _SPEED_BASE_DIR,
+                "output_root": _OUTPUT_ROOT,
+                "credentials_path": pargs.credentials,
+                "action": action,
+                "grid_size": grid_size,
+                "video_type": video_type,
+                "anchors_path": pargs.anchors_path,
+            }
+            procs = []
+            for i, chunk in enumerate(chunks[:n_workers]):
+                gpu_id = gpu_list[i]
+                worker_dir = os.path.join(_OUTPUT_ROOT, "worker_{}".format(i))
+                os.makedirs(worker_dir, exist_ok=True)
+                task_path = os.path.join(worker_dir, "tasks.json")
+                with open(task_path, "w", encoding="utf-8") as f:
+                    json.dump({"tasks": chunk, **worker_cfg_base}, f, indent=2)
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                script_path = os.path.abspath(__file__)
+                p = subprocess.Popen(
+                    [sys.executable, script_path, "--worker_tasks", task_path, "--worker_output_dir", worker_dir,
+                     "--credentials", pargs.credentials, "--grid", str(grid_size), "--video_type", video_type,
+                     "--action", action],
+                    env=env,
+                    cwd=os.path.dirname(script_path) or ".",
                 )
-                list_of_pair.append(pair)
-
-            averaged_pairs = calculate_max_mode_average(list_of_pair)
-            if _OUTPUT_ROOT:
-                minima_left_path = os.path.join(_OUTPUT_ROOT, "minima_left.json")
-                minima_right_path = os.path.join(_OUTPUT_ROOT, "minima_right.json")
-            else:
-                minima_left_path = "/home/EgoLoc/ManiTIL_prompt/minima_left_16.json"
-                minima_right_path = "/home/EgoLoc/ManiTIL_prompt/minima_right_16.json"
-            with open(minima_left_path, "w") as f:
+                procs.append((p, worker_dir, chunk))
+            for p, wdir, chunk in procs:
+                p.wait()
+                if p.returncode != 0:
+                    print("Worker {} 退出码 {}".format(wdir, p.returncode))
+            # 合并 predictions 与 minima（以已有结果为基础，再合并各 worker 输出）
+            pl_path = os.path.join(_OUTPUT_ROOT, "predictions_left.json")
+            pr_path = os.path.join(_OUTPUT_ROOT, "predictions_right.json")
+            merged_left = {p[0]: p[1] for p in (load_predictions(pl_path) if os.path.isfile(pl_path) else [])}
+            merged_right = {p[0]: p[1] for p in (load_predictions(pr_path) if os.path.isfile(pr_path) else [])}
+            for _, wdir, _ in procs:
+                for hand, name in [("left", "predictions_left.json"), ("right", "predictions_right.json")]:
+                    p = os.path.join(wdir, name)
+                    if os.path.isfile(p):
+                        for vid, pairs in load_predictions(p):
+                            (merged_left if hand == "left" else merged_right)[vid] = pairs
+            save_predictions([[k, v] for k, v in sorted(merged_left.items(), key=lambda x: x[0])], os.path.join(_OUTPUT_ROOT, "predictions_left.json"))
+            save_predictions([[k, v] for k, v in sorted(merged_right.items(), key=lambda x: x[0])], os.path.join(_OUTPUT_ROOT, "predictions_right.json"))
+            for _, wdir, _ in procs:
+                for hand, fname in [("left", "minima_left.json"), ("right", "minima_right.json")]:
+                    p = os.path.join(wdir, fname)
+                    if os.path.isfile(p):
+                        with open(p, "r") as f:
+                            data = json.load(f)
+                        minima_cache[hand].update(data)
+            with open(os.path.join(_OUTPUT_ROOT, "minima_left.json"), "w") as f:
                 json.dump(minima_cache["left"], f, indent=2)
-            with open(minima_right_path, "w") as f:
+            with open(os.path.join(_OUTPUT_ROOT, "minima_right.json"), "w") as f:
                 json.dump(minima_cache["right"], f, indent=2)
-            if len(averaged_pairs) == 0:
-                print(f"{video_file} ({hand}) can't predict")
-                all_predictions.append([video_file, []])
+            print("多 GPU 合并完成。")
+        # 多 GPU 分支结束后仍执行评估（与单 GPU 一致）
+    else:
+        # ---------- 单 GPU：原有顺序循环 ----------
+        for hand in ["left", "right"]:
+            print(f"\n====== 处理 {hand} 手 ======\n")
+
+            # 每只手一份结果文件（自适应输出时使用可读文件名）
+            if _OUTPUT_ROOT:
+                save_path = os.path.join(_OUTPUT_ROOT, "predictions_right.json" if hand == "right" else "predictions_left.json")
             else:
-                print(f"{video_file} ({hand}) pairs: {averaged_pairs}")
-                all_predictions.append([video_file, averaged_pairs])
+                save_path = "/home/EgoLoc/ManiTIL_prompt/r16.json" if hand == "right" else "/home/EgoLoc/ManiTIL_prompt/l16.json"
 
-            save_predictions(all_predictions, save_path)
+            all_predictions = load_predictions(save_path)
+            processed_video_files = {prediction[0] for prediction in all_predictions}
 
-        # 每只手各自评估一次
-        if video_type == "short":
+            for video_file in sorted_video_files:
+                if video_file in processed_video_files:
+                    continue
+
+                video_path = os.path.join(video_folder, video_file)
+                if not os.path.exists(video_path):
+                    continue
+
+                list_of_pair = []
+                for i in range(1):
+                    pair = convert_video(
+                        video_path,
+                        action,
+                        credentials,
+                        grid_size,
+                        video_type=video_type,
+                        max_feedback=3,
+                        hand=hand,  # ⭐ 关键：这一轮是 hand
+                        anchors_cache=anchors_cache,
+                    )
+                    list_of_pair.append(pair)
+
+                averaged_pairs = calculate_max_mode_average(list_of_pair)
+                if _OUTPUT_ROOT:
+                    minima_left_path = os.path.join(_OUTPUT_ROOT, "minima_left.json")
+                    minima_right_path = os.path.join(_OUTPUT_ROOT, "minima_right.json")
+                else:
+                    minima_left_path = "/home/EgoLoc/ManiTIL_prompt/minima_left_16.json"
+                    minima_right_path = "/home/EgoLoc/ManiTIL_prompt/minima_right_16.json"
+                with open(minima_left_path, "w") as f:
+                    json.dump(minima_cache["left"], f, indent=2)
+                with open(minima_right_path, "w") as f:
+                    json.dump(minima_cache["right"], f, indent=2)
+                if len(averaged_pairs) == 0:
+                    print(f"{video_file} ({hand}) can't predict")
+                    all_predictions.append([video_file, []])
+                else:
+                    print(f"{video_file} ({hand}) pairs: {averaged_pairs}")
+                    all_predictions.append([video_file, averaged_pairs])
+
+                save_predictions(all_predictions, save_path)
+
+    # 每只手各自评估一次（单 GPU 与多 GPU 合并后均执行）
+    if video_type == "short":
+        for hand in ["left", "right"]:
+            save_path = os.path.join(_OUTPUT_ROOT, "predictions_right.json" if hand == "right" else "predictions_left.json") if _OUTPUT_ROOT else ("/home/EgoLoc/ManiTIL_prompt/r16.json" if hand == "right" else "/home/EgoLoc/ManiTIL_prompt/l16.json")
             result = evaluate_predictions(
                 json_path=save_path,
                 gt_excel_path="/home/EgoLoc/ground_truth/KitchenCounter1.xlsx",
@@ -3418,68 +3620,72 @@ if __name__ == "__main__":
             )
             print(f"\nEvaluation ({hand}):", result)
 
-        elif video_type == "long":
-            gt_json = "/home/EgoLoc/hand_data_drawer/ego4dvideo/result.json"
+    elif video_type == "long":
+        gt_json = "/data/EgoLoc/EgoDex/long/long.json"
 
-            if _OUTPUT_ROOT:
-                pred_left = os.path.join(_OUTPUT_ROOT, "predictions_left.json")
-                pred_right = os.path.join(_OUTPUT_ROOT, "predictions_right.json")
-                minima_left_path = os.path.join(_OUTPUT_ROOT, "minima_left.json")
-                minima_right_path = os.path.join(_OUTPUT_ROOT, "minima_right.json")
+        if _OUTPUT_ROOT:
+            pred_left = os.path.join(_OUTPUT_ROOT, "predictions_left.json")
+            pred_right = os.path.join(_OUTPUT_ROOT, "predictions_right.json")
+            minima_left_path = os.path.join(_OUTPUT_ROOT, "minima_left.json")
+            minima_right_path = os.path.join(_OUTPUT_ROOT, "minima_right.json")
+        else:
+            pred_left = "/home/EgoLoc/ManiTIL_prompt/l16.json"
+            pred_right = "/home/EgoLoc/ManiTIL_prompt/r16.json"
+            minima_left_path = "/home/EgoLoc/ManiTIL_prompt/minima_left_16.json"
+            minima_right_path = "/home/EgoLoc/ManiTIL_prompt/minima_right_16.json"
+
+        # GT 左右手都为空则该视频不纳入计算
+        gts_left = load_ground_truth_json_twohands(gt_json, hand="left")
+        gts_right = load_ground_truth_json_twohands(gt_json, hand="right")
+        all_gt_videos = set(gts_left.keys()) | set(gts_right.keys())
+        videos_to_exclude = {
+            v for v in all_gt_videos
+            if not gts_left.get(v, {}).get("pairs", []) and not gts_right.get(v, {}).get("pairs", [])
+        }
+
+        results_left = evaluate_all_stages(
+            pred_json_path=pred_left,
+            gt_json_path=gt_json,
+            hand="left",
+            minima_json_path=minima_left_path,
+            videos_to_exclude=videos_to_exclude,
+        )
+
+        results_right = evaluate_all_stages(
+            pred_json_path=pred_right,
+            gt_json_path=gt_json,
+            hand="right",
+            minima_json_path=minima_right_path,
+            videos_to_exclude=videos_to_exclude,
+        )
+
+        print("\nEvaluation (left):")
+        for k, v in results_left.items():
+            if isinstance(v, (int, float)) and v is not None:
+                print(f"{k}: {v:.4f}")
             else:
-                pred_left = "/home/EgoLoc/ManiTIL_prompt/l16.json"
-                pred_right = "/home/EgoLoc/ManiTIL_prompt/r16.json"
-                minima_left_path = "/home/EgoLoc/ManiTIL_prompt/minima_left_16.json"
-                minima_right_path = "/home/EgoLoc/ManiTIL_prompt/minima_right_16.json"
+                print(f"{k}: {v}")
 
-            results_left = evaluate_all_stages(
-                pred_json_path=pred_left,
-                gt_json_path=gt_json,
-                hand="left",
-                minima_json_path=minima_left_path,
-            )
+        print("\nEvaluation (right):")
+        for k, v in results_right.items():
+            if isinstance(v, (int, float)) and v is not None:
+                print(f"{k}: {v:.4f}")
+            else:
+                print(f"{k}: {v}")
 
-            results_right = evaluate_all_stages(
-                pred_json_path=pred_right,
-                gt_json_path=gt_json,
-                hand="right",
-                minima_json_path=minima_right_path,
-            )
-
-            print("\nEvaluation (left):")
-            for k, v in results_left.items():
-                if isinstance(v, (int, float)) and v is not None:
-                    print(f"{k}: {v:.4f}")
-                else:
-                    print(f"{k}: {v}")
-
-            print("\nEvaluation (right):")
-            for k, v in results_right.items():
-                if isinstance(v, (int, float)) and v is not None:
-                    print(f"{k}: {v:.4f}")
-                else:
-                    print(f"{k}: {v}")
-
-
-            # ---- 可选：左右手整体平均（只平均 stage3 里的数值指标）----
-            results_both = {
-                "hand": "both",
-                "stage3": {},
-            }
-
-            # 你要平均的指标（stage3）
-            keys_to_avg = ["SR@1", "SR@3", "SR@5", "PSR", "mae", "MoF", "IoU"]
-
-            for k in keys_to_avg:
-                a = results_left.get("stage3", {}).get(k, None)
-                b = results_right.get("stage3", {}).get(k, None)
-                vals = [x for x in [a, b] if isinstance(x, (int, float)) and x is not None]
-                results_both["stage3"][k] = float(np.mean(vals)) if vals else None
-
-            print("\nEvaluation (both-avg):")
-            print("hand:", results_both["hand"])
-            for k in keys_to_avg:
-                v = results_both["stage3"][k]
-                print(f"{k}: {v:.4f}" if isinstance(v, (int, float)) else f"{k}: None")
+        # ---- 左右手一起评估（按接触对合并，非简单 (L+R)/2）----
+        results_both_pooled = evaluate_all_stages_pooled_twohands(
+            pred_left_path=pred_left,
+            pred_right_path=pred_right,
+            gt_json_path=gt_json,
+            sr_tolerances=(1, 3, 5),
+            psr_tolerance=10,
+        )
+        keys_stage3 = ["SR@1", "SR@3", "SR@5", "PSR", "mae", "MoF", "IoU"]
+        print("\nEvaluation (both-pooled):  # 左右手全部 (video,hand) 样本一起算 stage3 再平均，按接触对数自然加权")
+        print("hand:", results_both_pooled["hand"])
+        for k in keys_stage3:
+            v = results_both_pooled.get("stage3", {}).get(k)
+            print(f"{k}: {v:.4f}" if isinstance(v, (int, float)) else f"{k}: None")
 
 
