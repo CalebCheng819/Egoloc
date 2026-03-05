@@ -17,6 +17,7 @@ import pandas as pd
 import sys
 import subprocess
 import matplotlib.pyplot as plt
+import hashlib
 from scipy.signal import savgol_filter, find_peaks
 from scipy.interpolate import UnivariateSpline
 import re
@@ -43,6 +44,17 @@ from typing import List, Optional   # ← 新增这一行
 _model = None
 # 主进程的 minima_cache 引用，供 process_task 在未传入 minima_cache 时使用
 _MINIMA_CACHE_REF = None
+
+# Ablation switches（由命令行在 __main__ 中设置）
+_ABLATE_STATE_SCORING = False          # 去掉状态打分，改为硬标签
+_ABLATE_FEEDBACK = False               # 去掉 Level-3 反馈迭代
+_ABLATE_MATCHING_SPEED_ONLY = False    # 兼容旧开关：全局配对只用速度 cost（忽略时间窗与 VLM picked）
+
+# New experiment modes（由命令行在 __main__ 中设置）
+# - global matching cost mode: which terms to keep in Hungarian cost
+_GLOBAL_MATCHING_MODE = "full"         # {"full","speed_only","vlm_speed","speed_window"}
+# - L2.5 feedback scoring mode: how to pick best candidate frame in feedback loop
+_FEEDBACK_SCORE_MODE = "vlm_speed"     # {"speed_only","vlm_speed","vlm_timewindow"}
 
 
 def get_model():
@@ -1749,126 +1761,127 @@ def level3_pairing(
         return contact_conf, sep_conf
 
     # ---- resolve conflicts iteratively ----
-    for rd in range(max_rounds):
-        contact_conf, sep_conf = _find_conflicts(pairs)
+    if not _ABLATE_FEEDBACK:
+        for rd in range(max_rounds):
+            contact_conf, sep_conf = _find_conflicts(pairs)
 
-        print(f"\n[Iter {rd}] pairs={len(pairs)} contact_conf={len(contact_conf)} sep_conf={len(sep_conf)}")
+            print(f"\n[Iter {rd}] pairs={len(pairs)} contact_conf={len(contact_conf)} sep_conf={len(sep_conf)}")
 
-        if not contact_conf and not sep_conf:
-            print("[Iter] stable, stop.")
-            break
+            if not contact_conf and not sep_conf:
+                print("[Iter] stable, stop.")
+                break
 
-        changed = False
+            changed = False
 
-        # -------------------------
-        # Phase A: resolve Contact conflicts (C matched to many S)
-        # fixed C -> choose ONE S
-        # -------------------------
-        if contact_conf:
-            new_pairs = []
-            drop_keys = set(contact_conf.keys())
+            # -------------------------
+            # Phase A: resolve Contact conflicts (C matched to many S)
+            # fixed C -> choose ONE S
+            # -------------------------
+            if contact_conf:
+                new_pairs = []
+                drop_keys = set(contact_conf.keys())
 
-            # keep non-conflict pairs
-            for c, s in pairs:
-                if c not in drop_keys:
-                    new_pairs.append((c, s))
+                # keep non-conflict pairs
+                for c, s in pairs:
+                    if c not in drop_keys:
+                        new_pairs.append((c, s))
 
-            # solve each conflict group
-            for c, ss in contact_conf.items():
-                # only keep separations after contact
-                ss = [s for s in ss if int(s) > int(c)]
-                if not ss:
-                    continue
+                # solve each conflict group
+                for c, ss in contact_conf.items():
+                    # only keep separations after contact
+                    ss = [s for s in ss if int(s) > int(c)]
+                    if not ss:
+                        continue
 
-                show_ss = _downsample(ss, center=c, limit=max_candidates_per_query)
+                    show_ss = _downsample(ss, center=c, limit=max_candidates_per_query)
 
-                dbg = None
-                if debug_dir is not None:
-                    dbg = str(debug_dir / f"confC_C{c}.png")
+                    dbg = None
+                    if debug_dir is not None:
+                        dbg = str(debug_dir / f"confC_C{c}.png")
 
-                grid = _make_referee_grid(
-                    video_path=video_path,
-                    contact_frames=[],
-                    separation_frames=show_ss,
-                    fixed_side="C",
-                    fixed_frame=c,
-                    debug_save_path=dbg
-                )
-                k = _vlm_choose_one(credentials=credentials, grid_bgr=grid, prompt=PROMPT_C_FIXED)
+                    grid = _make_referee_grid(
+                        video_path=video_path,
+                        contact_frames=[],
+                        separation_frames=show_ss,
+                        fixed_side="C",
+                        fixed_frame=c,
+                        debug_save_path=dbg
+                    )
+                    k = _vlm_choose_one(credentials=credentials, grid_bgr=grid, prompt=PROMPT_C_FIXED)
 
-                if k is None:
-                    chosen = _fallback_choose_closest(fixed_side="C", fixed_frame=c, candidates=show_ss)
-                else:
-                    idx = k - 1
-                    chosen = show_ss[idx] if 0 <= idx < len(show_ss) else None
+                    if k is None:
+                        chosen = _fallback_choose_closest(fixed_side="C", fixed_frame=c, candidates=show_ss)
+                    else:
+                        idx = k - 1
+                        chosen = show_ss[idx] if 0 <= idx < len(show_ss) else None
 
-                if chosen is not None:
-                    c_int = int(c)
-                    s_chosen = int(chosen)
-                    new_pairs.append((c_int, s_chosen))
-                    pair_meta[(c_int, s_chosen)]["picked"] += 1
-                    pair_meta[(c_int, s_chosen)]["src"].add("confC")
-                    changed = True
+                    if chosen is not None:
+                        c_int = int(c)
+                        s_chosen = int(chosen)
+                        new_pairs.append((c_int, s_chosen))
+                        pair_meta[(c_int, s_chosen)]["picked"] += 1
+                        pair_meta[(c_int, s_chosen)]["src"].add("confC")
+                        changed = True
 
-            pairs = new_pairs
+                pairs = new_pairs
 
-        # recompute after phase A
-        contact_conf, sep_conf = _find_conflicts(pairs)
+            # recompute after phase A
+            contact_conf, sep_conf = _find_conflicts(pairs)
 
-        # -------------------------
-        # Phase B: resolve Separation conflicts (S matched to many C)
-        # fixed S -> choose ONE C
-        # -------------------------
-        if sep_conf:
-            new_pairs = []
-            drop_keys = set(sep_conf.keys())
+            # -------------------------
+            # Phase B: resolve Separation conflicts (S matched to many C)
+            # fixed S -> choose ONE C
+            # -------------------------
+            if sep_conf:
+                new_pairs = []
+                drop_keys = set(sep_conf.keys())
 
-            # keep non-conflict pairs
-            for c, s in pairs:
-                if s not in drop_keys:
-                    new_pairs.append((c, s))
+                # keep non-conflict pairs
+                for c, s in pairs:
+                    if s not in drop_keys:
+                        new_pairs.append((c, s))
 
-            for s, cs in sep_conf.items():
-                # only keep contacts before separation
-                cs = [c for c in cs if int(c) < int(s)]
-                if not cs:
-                    continue
+                for s, cs in sep_conf.items():
+                    # only keep contacts before separation
+                    cs = [c for c in cs if int(c) < int(s)]
+                    if not cs:
+                        continue
 
-                show_cs = _downsample(cs, center=s, limit=max_candidates_per_query)
+                    show_cs = _downsample(cs, center=s, limit=max_candidates_per_query)
 
-                dbg = None
-                if debug_dir is not None:
-                    dbg = str(debug_dir / f"confS_S{s}.png")
+                    dbg = None
+                    if debug_dir is not None:
+                        dbg = str(debug_dir / f"confS_S{s}.png")
 
-                grid = _make_referee_grid(
-                    video_path=video_path,
-                    contact_frames=show_cs,
-                    separation_frames=[],
-                    fixed_side="S",
-                    fixed_frame=s,
-                    debug_save_path=dbg
-                )
-                k = _vlm_choose_one(credentials=credentials, grid_bgr=grid, prompt=PROMPT_S_FIXED)
+                    grid = _make_referee_grid(
+                        video_path=video_path,
+                        contact_frames=show_cs,
+                        separation_frames=[],
+                        fixed_side="S",
+                        fixed_frame=s,
+                        debug_save_path=dbg
+                    )
+                    k = _vlm_choose_one(credentials=credentials, grid_bgr=grid, prompt=PROMPT_S_FIXED)
 
-                if k is None:
-                    chosen = _fallback_choose_closest(fixed_side="S", fixed_frame=s, candidates=show_cs)
-                else:
-                    idx = k - 1
-                    chosen = show_cs[idx] if 0 <= idx < len(show_cs) else None
+                    if k is None:
+                        chosen = _fallback_choose_closest(fixed_side="S", fixed_frame=s, candidates=show_cs)
+                    else:
+                        idx = k - 1
+                        chosen = show_cs[idx] if 0 <= idx < len(show_cs) else None
 
-                if chosen is not None:
-                    c_chosen = int(chosen)
-                    s_int = int(s)
-                    new_pairs.append((c_chosen, s_int))
-                    pair_meta[(c_chosen, s_int)]["picked"] += 1
-                    pair_meta[(c_chosen, s_int)]["src"].add("confS")
-                    changed = True
+                    if chosen is not None:
+                        c_chosen = int(chosen)
+                        s_int = int(s)
+                        new_pairs.append((c_chosen, s_int))
+                        pair_meta[(c_chosen, s_int)]["picked"] += 1
+                        pair_meta[(c_chosen, s_int)]["src"].add("confS")
+                        changed = True
 
-            pairs = new_pairs
+                pairs = new_pairs
 
-        if not changed:
-            print("[Iter] no change in this round, stop.")
-            break
+            if not changed:
+                print("[Iter] no change in this round, stop.")
+                break
     speed_dict = None
     if speed_data:
         speed_dict = {int(f): float(v) for f, v in speed_data if np.isfinite(v)}
@@ -1881,17 +1894,61 @@ def level3_pairing(
     # ---- final enforce one-to-one (global optimal matching) ----
     # 可选：如果你有速度函数，就传进去；没有就 None
     matching_cfg = matching_cfg or {}
-    final_pairs = _final_one_to_one_by_matching(
-        pairs,
-        pair_meta=pair_meta,
-        W=matching_cfg.get("W", 300),
-        penalty=matching_cfg.get("penalty", 1000.0),
-        w_dt=matching_cfg.get("w_dt", 1.0),
-        w_window=matching_cfg.get("w_window", 1.0),
-        w_vlm=matching_cfg.get("w_vlm", -120.0),
-        speed_score_fn=speed_score_fn,  # ✅ now enabled
-        w_speed=matching_cfg.get("w_speed", 1.0),  # ✅ tune here
-    )
+    # 全局配对：根据模式选择 cost 组合
+    # 兼容：若旧开关开启，则等价于 speed_only
+    mode = "speed_only" if _ABLATE_MATCHING_SPEED_ONLY else _GLOBAL_MATCHING_MODE
+    if mode == "speed_only" and speed_dict is not None:
+        # 只用速度：忽略时间差、时间窗与 VLM picked 次数
+        final_pairs = _final_one_to_one_by_matching(
+            pairs,
+            pair_meta=pair_meta,
+            W=0,
+            penalty=0.0,
+            w_dt=0.0,
+            w_window=0.0,
+            w_vlm=0.0,
+            speed_score_fn=speed_score_fn,
+            w_speed=1.0,
+        )
+    elif mode == "vlm_speed" and speed_dict is not None:
+        # 只用 VLM(picked) + 速度：忽略时间差与时间窗
+        final_pairs = _final_one_to_one_by_matching(
+            pairs,
+            pair_meta=pair_meta,
+            W=0,
+            penalty=0.0,
+            w_dt=0.0,
+            w_window=0.0,
+            w_vlm=matching_cfg.get("w_vlm", -120.0),
+            speed_score_fn=speed_score_fn,
+            w_speed=matching_cfg.get("w_speed", 1.0),
+        )
+    elif mode == "speed_window" and speed_dict is not None:
+        # 只用 速度 + 时间窗（含 |s-c| 与超窗惩罚）：忽略 VLM(picked)
+        final_pairs = _final_one_to_one_by_matching(
+            pairs,
+            pair_meta=pair_meta,
+            W=matching_cfg.get("W", 300),
+            penalty=matching_cfg.get("penalty", 1000.0),
+            w_dt=matching_cfg.get("w_dt", 1.0),
+            w_window=matching_cfg.get("w_window", 1.0),
+            w_vlm=0.0,
+            speed_score_fn=speed_score_fn,
+            w_speed=matching_cfg.get("w_speed", 1.0),
+        )
+    else:
+        # full（默认）：时间差 + 时间窗 + VLM(picked) + 速度
+        final_pairs = _final_one_to_one_by_matching(
+            pairs,
+            pair_meta=pair_meta,
+            W=matching_cfg.get("W", 300),
+            penalty=matching_cfg.get("penalty", 1000.0),
+            w_dt=matching_cfg.get("w_dt", 1.0),
+            w_window=matching_cfg.get("w_window", 1.0),
+            w_vlm=matching_cfg.get("w_vlm", -120.0),
+            speed_score_fn=speed_score_fn,  # ✅ now enabled
+            w_speed=matching_cfg.get("w_speed", 1.0),  # ✅ tune here
+        )
 
     print("\n[Level-3] Final pairs:", final_pairs)
     return final_pairs
@@ -2247,7 +2304,7 @@ def scene_understanding(credentials, frame, prompt_message, principle=None):
             base_url="https://api.chatanywhere.tech/v1"
         )
         params = {
-            "model": "gpt-4o",
+            "model": "gemini-2.5-pro",
             "messages": PROMPT_MESSAGES,
             "max_tokens": 400,
             "temperature": 0.1,
@@ -2927,7 +2984,7 @@ def process_task(
         total_frames,
         frame_index=None,
         flag=None,
-        max_feedback=5,
+        max_feedback=3,
         video_type="short",
         keyframe_sampling_mode="adaptive",
         use_feedback=True,
@@ -3073,16 +3130,24 @@ def process_task(
         if hand=="left":
             grid_image.save(f"/home/EgoLoc/grid/left2/{video_name}_L{left_idx}_R{right_idx}.png")
         grid_image.save(debug_dir / f"{video_name}_state.png")
-        # state = scene_understanding(
-        #     credentials, image_state, prompt_state, principle="state")
-        state_raw = scene_understanding(
-            credentials, image_state, prompt_state, principle="state_score"
-        )
-        print("[RAW STATE OUTPUT]")
-        print(state_raw)
-        c_score, s_score = parse_state_scores(state_raw)
-        state = decide_state_from_scores(c_score, s_score)
-        print(f"[STATE DECISION] c={c_score}, s={s_score} → {state}")
+
+        # 状态判别：根据消融开关选择“打分模式”或“硬标签模式”
+        if not _ABLATE_STATE_SCORING:
+            # 原始：state_score + parse + 阈值
+            state_raw = scene_understanding(
+                credentials, image_state, prompt_state, principle="state_score"
+            )
+            print("[RAW STATE OUTPUT]")
+            print(state_raw)
+            c_score, s_score = parse_state_scores(state_raw)
+            state = decide_state_from_scores(c_score, s_score)
+            print(f"[STATE DECISION] c={c_score}, s={s_score} → {state}")
+        else:
+            # 消融：直接让 VLM 输出 Event: Contact / Separation / Neither
+            state = scene_understanding(
+                credentials, image_state, prompt_state, principle="state"
+            )
+            print(f"[STATE HARD] {state}")
         # ✅ 记录下来（只接受三类）
         if state in ["Contact", "Separation", "Neither","Ambiguous"]:
             state_list.append(state)
@@ -3127,6 +3192,7 @@ def process_task(
 
                         # 选用 score prompt
                         feedback_prompt = fb_score_contact if state == "Contact" else fb_score_separation
+                        feedback_score_mode = _FEEDBACK_SCORE_MODE  # speed_only / vlm_speed / vlm_timewindow
 
                         while feedback_count < max_feedback:
                             # 1) 构造候选集合（中心±feedback_window，排除试过的）
@@ -3138,7 +3204,8 @@ def process_task(
                                 break
 
                             # 2) 对每个候选打分，选最高分
-                            best = None  # (total_score, score_vlm, score_spd, frame, label, reason)
+                            # best: (total_score, score_vlm, score_spd, score_time, frame, label, reason)
+                            best = None
                             for cand in feedback_candidates:
                                 tried_frames.add(cand)
 
@@ -3150,14 +3217,15 @@ def process_task(
                                 # 你可以改用 create_frame_grid_state，它支持自动排版：
                                 # ctx_img = create_frame_grid_state(video_path, ctx_frames, hand=hand)
 
-                                feedback_result = scene_understanding(
-                                    credentials, ctx_img, feedback_prompt, principle="feedback"
-                                )
-                                score_vlm, label, reason = extract_score_info(feedback_result)
-
-                                if score_vlm is None or not np.isfinite(score_vlm):
-                                    continue
-                                score_vlm = float(np.clip(score_vlm, 0.0, 1.0))
+                                score_vlm, score_vlm_f, label, reason = None, 0.0, None, None
+                                if feedback_score_mode in ("vlm_speed", "vlm_timewindow"):
+                                    feedback_result = scene_understanding(
+                                        credentials, ctx_img, feedback_prompt, principle="feedback"
+                                    )
+                                    score_vlm, label, reason = extract_score_info(feedback_result)
+                                    if score_vlm is None or (not np.isfinite(score_vlm)):
+                                        continue
+                                    score_vlm_f = float(np.clip(float(score_vlm), 0.0, 1.0))
 
                                 # ---- 速度先验：速度越小越加分（可选但很有用）----
                                 if np.any(all_frames == cand):
@@ -3168,10 +3236,23 @@ def process_task(
                                 # 归一化到 0~1（粗暴一点就够用）
                                 score_spd = float(np.clip(score_spd / (score_spd + 1.0), 0.0, 1.0))
 
-                                total_score = 0.85 * score_vlm + 0.15 * score_spd
+                                # ---- 时间窗先验：越靠近当前中心帧越加分 ----
+                                # feedback_candidates 本身来自 ±feedback_window，这里把距离归一化到 0~1
+                                dist = abs(int(cand) - int(final_frame))
+                                denom = float(max(1, feedback_window))
+                                score_time = float(np.clip(1.0 - (dist / denom), 0.0, 1.0))
+
+                                if feedback_score_mode == "speed_only":
+                                    total_score = score_spd
+                                elif feedback_score_mode == "vlm_timewindow":
+                                    # VLM + 时间窗（不使用速度）
+                                    total_score = 0.85 * score_vlm_f + 0.15 * score_time
+                                else:
+                                    # 默认：VLM + 速度（原始行为）
+                                    total_score = 0.85 * score_vlm_f + 0.15 * score_spd
 
                                 if (best is None) or (total_score > best[0]):
-                                    best = (total_score, score_vlm, score_spd, cand, label, reason)
+                                    best = (total_score, score_vlm_f, score_spd, score_time, cand, label, reason)
 
                             if best is None:
                                 feedback_count += 1
@@ -3179,15 +3260,24 @@ def process_task(
                                 continue
 
                             # 3) 采用最高分帧作为新的 final_frame
-                            total_score, score_vlm, score_spd, cand, label, reason = best
+                            total_score, score_vlm_f, score_spd, score_time, cand, label, reason = best
                             final_frame = cand
 
-                            print(f"[FEEDBACK] state={state} best_frame={cand} "
-                                  f"total={total_score:.3f} vlm={score_vlm:.3f} spd={score_spd:.3f} "
-                                  f"label={label} reason={reason}")
+                            # 打印不同模式的分解
+                            if feedback_score_mode == "speed_only":
+                                print(f"[FEEDBACK speed_only] state={state} best_frame={cand} "
+                                      f"total={total_score:.3f} spd={score_spd:.3f}")
+                            elif feedback_score_mode == "vlm_timewindow":
+                                print(f"[FEEDBACK vlm_timewindow] state={state} best_frame={cand} "
+                                      f"total={total_score:.3f} vlm={score_vlm_f:.3f} time={score_time:.3f} "
+                                      f"label={label} reason={reason}")
+                            else:
+                                print(f"[FEEDBACK vlm_speed] state={state} best_frame={cand} "
+                                      f"total={total_score:.3f} vlm={score_vlm_f:.3f} spd={score_spd:.3f} "
+                                      f"label={label} reason={reason}")
 
                             # 4) 严出：过阈值才算 correct
-                            if score_vlm >= score_thr:
+                            if (feedback_score_mode in ("vlm_speed", "vlm_timewindow")) and (score_vlm_f >= score_thr):
                                 correct = True
                                 break
 
@@ -3366,6 +3456,21 @@ parser.add_argument('--worker_tasks', type=str, default=None,
                     help='[内部] Worker 模式：任务 JSON 路径，处理指定任务并写入 worker_output_dir')
 parser.add_argument('--worker_output_dir', type=str, default=None,
                     help='[内部] Worker 模式：本进程输出目录')
+parser.add_argument('--ablate_state', action='store_true',
+                    help='消融：关闭状态打分（state_score），改为硬标签 Event 判别')
+parser.add_argument('--ablate_feedback', action='store_true',
+                    help='消融：关闭 Level-3 反馈迭代，只保留初始配对')
+parser.add_argument('--ablate_speed_only', action='store_true',
+                    help='消融：全局配对 cost 只使用速度项（忽略时间窗和 VLM picked）')
+parser.add_argument('--global_matching_mode', type=str, default='full',
+                    choices=['full', 'speed_only', 'vlm_speed', 'speed_window'],
+                    help='全局匹配(Hungarian) cost 组合：full=时间+窗+VLM(picked)+速度；'
+                         'speed_only=仅速度；vlm_speed=VLM(picked)+速度；speed_window=速度+时间窗(含|s-c|)')
+parser.add_argument('--feedback_score_mode', type=str, default='vlm_speed',
+                    choices=['speed_only', 'vlm_speed', 'vlm_timewindow'],
+                    help='L2.5 反馈打分选帧策略：speed_only=仅速度；vlm_speed=VLM分数+速度；vlm_timewindow=VLM分数+时间窗(靠近中心帧)')
+parser.add_argument('--tag', type=str, default=None,
+                    help='自定义实验标签，会追加到输出目录名与 meta.json（例如 "expA" / "abl1_seed0"）')
 pargs, unknown = parser.parse_known_args()
 credentials = dotenv.dotenv_values(pargs.credentials)
 required_keys = ["OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"]
@@ -3380,6 +3485,19 @@ folder_name = action.replace(" ", "_")
 output_folder = f"results/{folder_name}"
 # os.makedirs(output_folder, exist_ok=True)
 if __name__ == "__main__":
+    # 设置消融开关（模块级变量，供各函数读取）
+    if pargs.ablate_state:
+        print("[ABLATION] 状态判别：使用硬标签模式（不再用打分阈值）")
+    if pargs.ablate_feedback:
+        print("[ABLATION] 反馈模块：关闭 Level-3 迭代反馈，仅保留初始配对")
+    if pargs.ablate_speed_only:
+        print("[ABLATION] 全局配对：仅使用速度匹配 cost，忽略时间窗和 VLM picked")
+    _ABLATE_STATE_SCORING = bool(pargs.ablate_state)
+    _ABLATE_FEEDBACK = bool(pargs.ablate_feedback)
+    _ABLATE_MATCHING_SPEED_ONLY = bool(pargs.ablate_speed_only)
+    # New modes
+    _GLOBAL_MATCHING_MODE = str(getattr(pargs, "global_matching_mode", "full") or "full")
+    _FEEDBACK_SCORE_MODE = str(getattr(pargs, "feedback_score_mode", "vlm_speed") or "vlm_speed")
     # ---------- Worker 模式：子进程处理指定任务，写入 worker_output_dir ----------
     if getattr(pargs, "worker_tasks", None) and getattr(pargs, "worker_output_dir", None):
         with open(pargs.worker_tasks, "r", encoding="utf-8") as f:
@@ -3428,24 +3546,66 @@ if __name__ == "__main__":
 
     if pargs.speed_root is not None:
         _SPEED_BASE_DIR = pargs.speed_root  # 覆盖模块级变量，供 get_json_* 与 extract_* 使用
+    # 规范化 tag：仅保留 [A-Za-z0-9_.-]，其余替换为 '-'
+    _tag = getattr(pargs, "tag", None)
+    _tag_clean = None
+    if _tag:
+        _tag_clean = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(_tag)).strip("-")[:60] or None
+
     # 构建输出根目录：显式指定或按日期+配置自动生成
     if pargs.output_dir:
         _OUTPUT_ROOT = pargs.output_dir
+        if _tag_clean:
+            _OUTPUT_ROOT = f"{_OUTPUT_ROOT}__TAG_{_tag_clean}"
     else:
-        basename = os.path.basename(video_folder.rstrip(os.sep))
-        _OUTPUT_ROOT = "output/egoloc_{}_{}_grid{}_{}".format(
+        # 将原视频目录路径编码进输出目录名，便于区分不同数据源（避免过长：截断+hash）
+        vf_norm = os.path.normpath(str(video_folder)).rstrip(os.sep)
+        vf_tag_full = vf_norm.lstrip(os.sep).replace(os.sep, "_")
+        vf_hash = hashlib.md5(vf_norm.encode("utf-8")).hexdigest()[:8]
+        vf_tag = vf_tag_full[-80:]  # 截取尾部，通常包含数据集/子目录信息
+        vf_tag = f"{vf_tag}_{vf_hash}"
+
+        # 消融标签也写入输出目录名
+        ab_tags = []
+        if pargs.ablate_state:
+            ab_tags.append("NoStateScore")
+        if pargs.ablate_feedback:
+            ab_tags.append("NoFeedback")
+        # 全局匹配模式标签（优先使用 global_matching_mode；旧开关 ablate_speed_only 视为 speed_only）
+        gm = "speed_only" if pargs.ablate_speed_only else getattr(pargs, "global_matching_mode", "full")
+        if gm and gm != "full":
+            ab_tags.append(f"GM_{gm}")
+        # 反馈打分模式标签（只在 use_feedback=True 时生效，但写入目录便于区分）
+        fsm = getattr(pargs, "feedback_score_mode", "vlm_speed")
+        if fsm and fsm != "vlm_speed":
+            ab_tags.append(f"FBScore_{fsm}")
+        if _tag_clean:
+            ab_tags.append(f"TAG_{_tag_clean}")
+        ab_suffix = ("__" + "_".join(ab_tags)) if ab_tags else ""
+
+        _OUTPUT_ROOT = "output/egoloc_{}_{}_grid{}_{}{}".format(
             datetime.now().strftime("%Y-%m-%d_%H%M"),
             video_type,
             grid_size,
-            basename,
+            vf_tag,
+            ab_suffix,
         )
     os.makedirs(_OUTPUT_ROOT, exist_ok=True)
     meta = {
         "video_folder": video_folder,
+        "video_folder_tag": vf_tag if not pargs.output_dir else None,
+        "tag": _tag,
         "speed_root": _SPEED_BASE_DIR,
         "video_type": video_type,
         "grid_size": grid_size,
         "action": action,
+        "ablation": {
+            "ablate_state": bool(pargs.ablate_state),
+            "ablate_feedback": bool(pargs.ablate_feedback),
+            "ablate_speed_only": bool(pargs.ablate_speed_only),
+            "global_matching_mode": ("speed_only" if pargs.ablate_speed_only else getattr(pargs, "global_matching_mode", "full")),
+            "feedback_score_mode": getattr(pargs, "feedback_score_mode", "vlm_speed"),
+        },
         "output_root": _OUTPUT_ROOT,
         "timestamp": datetime.now().isoformat(),
     }
@@ -3515,10 +3675,26 @@ if __name__ == "__main__":
                 env = os.environ.copy()
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
                 script_path = os.path.abspath(__file__)
+                worker_cmd = [
+                    sys.executable, script_path,
+                    "--worker_tasks", task_path,
+                    "--worker_output_dir", worker_dir,
+                    "--credentials", pargs.credentials,
+                    "--grid", str(grid_size),
+                    "--video_type", video_type,
+                    "--action", action,
+                    "--global_matching_mode", str(getattr(pargs, "global_matching_mode", "full")),
+                    "--feedback_score_mode", str(getattr(pargs, "feedback_score_mode", "vlm_speed")),
+                ]
+                if getattr(pargs, "ablate_state", False):
+                    worker_cmd.append("--ablate_state")
+                if getattr(pargs, "ablate_feedback", False):
+                    worker_cmd.append("--ablate_feedback")
+                # 兼容旧开关
+                if getattr(pargs, "ablate_speed_only", False):
+                    worker_cmd.append("--ablate_speed_only")
                 p = subprocess.Popen(
-                    [sys.executable, script_path, "--worker_tasks", task_path, "--worker_output_dir", worker_dir,
-                     "--credentials", pargs.credentials, "--grid", str(grid_size), "--video_type", video_type,
-                     "--action", action],
+                    worker_cmd,
                     env=env,
                     cwd=os.path.dirname(script_path) or ".",
                 )
